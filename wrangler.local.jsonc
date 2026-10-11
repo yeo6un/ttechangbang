@@ -1,0 +1,16 @@
+{
+  // 내 컴퓨터에서 Cloudflare 환경 그대로 돌려 볼 때 쓰는 설정 (로그인 불필요, AI 바인딩만 뺐다)
+  //   npm run build && npm run cf:dev
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ttechangbang-local",
+  "main": "server/worker.js",
+  "compatibility_date": "2025-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/", "/new", "/r/*"]
+  },
+  "d1_databases": [{ "binding": "DB", "database_name": "ttechangbang", "database_id": "00000000-0000-0000-0000-000000000000" }]
+}

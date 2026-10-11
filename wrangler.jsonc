@@ -1,0 +1,21 @@
+{
+  // 떼창방 — Cloudflare Workers 무료 플랜으로 돌아가는 설정
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ttechangbang",
+  "main": "server/worker.js",
+  "compatibility_date": "2025-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/", "/new", "/r/*"]
+  },
+  // 방·녹음을 저장하는 데이터베이스 (무료 5GB). 처음 배포할 때 자동으로 만들어진다.
+  "d1_databases": [{ "binding": "DB", "database_name": "ttechangbang" }],
+  // AI 가사 싱크·파트 추천 (Workers AI 무료 할당량). 빼도 나머지 기능은 그대로 동작한다.
+  "ai": { "binding": "AI" },
+  // 하루 한 번, 기간이 끝난 방을 지운다.
+  "triggers": { "crons": ["17 19 * * *"] },
+  "observability": { "enabled": true }
+}
