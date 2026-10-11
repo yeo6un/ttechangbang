@@ -51,8 +51,27 @@ export function fakeWorld(opts) {
       if (T.calibGain) node.connect(T.calibGain);
     },
     onGraph() {},
+    /**
+     * 파일 반주(MR)가 재생될 때. singMr 을 켜 두면 가수가 MR에 맞춰 줄 시작마다 소리를 낸다
+     * (영상 없이 MR만 듣고 부르는 녹음을 흉내 낸다).
+     */
     onPlay(info) {
       T.plays.push(info);
+      const ctx = T.micCtx;
+      if (!T.singMr || !ctx || !T.voice) return;
+      for (const s of T.clickTimes) {
+        if (s < info.from || s > info.until) continue;
+        const at = info.tZero + s;
+        const osc = ctx.createOscillator();
+        const g = ctx.createGain();
+        osc.frequency.value = 880;
+        g.gain.setValueAtTime(0, 0);
+        g.gain.setValueAtTime(0.5, at);
+        g.gain.exponentialRampToValueAtTime(0.001, at + 0.3);
+        osc.connect(g).connect(T.voice);
+        osc.start(at);
+        osc.stop(at + 0.35);
+      }
     },
 
     /**
@@ -133,12 +152,13 @@ export function fakeWorld(opts) {
     },
 
     /** 앱이 목소리를 영상에 맞춰 깔 때마다: 앱이 잡은 싱크가 참값과 얼마나 다른지 적어 둔다 */
-    onYtVoices({ tZero, from, segStart }) {
+    onYtVoices({ tZero, from, segStart, starts }) {
       const p = T.players.filter((x) => !x.dead && x.state === 1).pop();
-      const ctx = T.lib?.getCtx?.();
+      // 목소리를 까는 소리 시계: 녹음 중이면 마이크의 것, 아니면 화면이 쓰는 것
+      const ctx = T.voiceCtx || T.lib?.getCtx?.();
       if (!p || !ctx) return;
       const truth = segStart - (p.base - p.t0 / 1000) + T.audibleOffset(ctx);
-      T.voices.push({ tZero, from, errorMs: (tZero - truth) * 1000 });
+      T.voices.push({ tZero, from, starts: starts || [], errorMs: (tZero - truth) * 1000 });
     },
 
     // ───── 유튜브 플레이어 ─────
@@ -444,3 +464,41 @@ export function judgeSync(errorsMs) {
   const typical = sorted.length >= 3 ? sorted[sorted.length - 2] : worst;
   return { typical, worst };
 }
+
+/** 방 상태를 그 사용자의 권한으로 읽는다 */
+export const readRoom = (page, code) =>
+  page.evaluate(async (c) => {
+    const who = JSON.parse(localStorage.getItem(`ttb.id.${c}`));
+    return (await fetch(`/api/rooms/${c}`, { headers: { authorization: `Bearer ${who.id}.${who.key}` } })).json();
+  }, code);
+
+/** 저장된 내 녹음을 받아 풀고, 줄 시작마다 낸 소리가 몇 ms 어긋나 있는지 잰다 */
+export const measureClicks = (page, code) =>
+  page.evaluate(async (c) => {
+    const who = JSON.parse(localStorage.getItem(`ttb.id.${c}`));
+    const auth = { authorization: `Bearer ${who.id}.${who.key}` };
+    const room = await (await fetch(`/api/rooms/${c}`, { headers: auth })).json();
+    const { decodeWithLead, getCtx } = window.__ttbTest.lib;
+    const out = [];
+    for (const take of room.takes.filter((t) => t.member === who.id)) {
+      const bytes = await (await fetch(`/api/rooms/${c}/blobs/${take.blob}`, { headers: auth })).arrayBuffer();
+      const buf = await decodeWithLead(bytes, getCtx());
+      const x = buf.getChannelData(0);
+      const sr = buf.sampleRate;
+      let peak = 0;
+      for (let i = 0; i < x.length; i++) peak = Math.max(peak, Math.abs(x[i]));
+      for (const line of room.lines) {
+        const expect = Math.round((line.t0 - take.start) * sr);
+        if (expect < sr * 0.05 || expect > x.length - sr * 0.3) continue;
+        let onset = -1;
+        for (let i = expect - Math.round(sr * 0.15); i < expect + Math.round(sr * 0.15); i++) {
+          if (Math.abs(x[i]) > peak * 0.25) {
+            onset = i;
+            break;
+          }
+        }
+        if (onset >= 0) out.push({ line: line.t0, errorMs: ((onset - expect) / sr) * 1000, latencyMs: take.latencyMs });
+      }
+    }
+    return out;
+  }, code);

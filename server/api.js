@@ -9,11 +9,14 @@ const DAY = 86_400_000;
 const HOUR = 3_600_000;
 
 export const LIMITS = {
-  songBytes: 6 * 1024 * 1024,
+  songBytes: 8 * 1024 * 1024,
   takeBytes: 3 * 1024 * 1024,
-  songSeconds: 125,
+  /** 반주(MR) 파일은 한 곡 전체까지 올릴 수 있다 */
+  songSeconds: 330,
   /** 유튜브 영상을 반주로 쓰는 방은 음원을 저장하지 않으므로 한 곡 전체까지 허용한다 */
   ytSeconds: 330,
+  /** AI 가 듣고 가사 타이밍을 맞추는 일은 짧은 구간에서만 한다 (긴 파일은 무료 한도 안에서 처리하기 어렵다) */
+  aiSeconds: 130,
   seats: 8,
   lines: 200,
   lineText: 140,
@@ -375,10 +378,30 @@ function sanitizeYt(raw) {
   };
 }
 
+/**
+ * 가이드 영상: 반주(MR) 파일로 부르는 방에 "원곡 영상"을 붙여 두고, 녹음할 때 보고 들으며 따라 부른다.
+ * start 는 MR 구간의 0초가 영상의 몇 초인지 (MR 앞부분이 영상보다 길면 음수가 된다).
+ * loose: 영상과 MR이 딱 맞지 않아서 "미리 듣기"로만 쓰는 경우.
+ */
+function sanitizeGuide(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const id = parseYtId(raw.id);
+  if (!id) fail(400, 'bad_video', '유튜브 영상 주소가 올바르지 않아요.');
+  return {
+    id,
+    start: Math.round(num(raw.start, -600, 43200, 0) * 1000) / 1000,
+    len: Math.round(num(raw.len, 0, 43200, 0)),
+    title: cleanText(raw.title, 120),
+    author: cleanText(raw.author, 80),
+    ...(raw.loose ? { loose: true } : {}),
+  };
+}
+
 const safeArt = (v) => (typeof v === 'string' && v.length <= 300 && /^https:\/\/([a-z0-9-]+\.)*(mzstatic\.com|ytimg\.com)\//.test(v) ? v : '');
 
 function sanitizeSongMeta(raw) {
   const yt = sanitizeYt(raw?.yt);
+  const guide = yt ? null : sanitizeGuide(raw?.guide);
   const dur = num(raw?.dur, 1, yt ? LIMITS.ytSeconds : LIMITS.songSeconds, NaN);
   if (!Number.isFinite(dur)) fail(400, 'bad_song', '곡 길이 정보가 올바르지 않아요.');
   const peaks = typeof raw.peaks === 'string' && raw.peaks.length <= 4000 && /^[A-Za-z0-9+/=]*$/.test(raw.peaks) ? raw.peaks : '';
@@ -393,6 +416,7 @@ function sanitizeSongMeta(raw) {
     beat0: num(raw.beat0, 0, 10, 0),
     demo: !!raw.demo,
     ...(yt ? { yt } : {}),
+    ...(guide ? { guide } : {}),
   };
 }
 
@@ -417,7 +441,13 @@ async function route(request, env, ctx) {
   const ip = clientIp(request);
 
   if (seg[0] === 'config' && method === 'GET') {
-    return json({ ai: !!env.AI, find: true, ytSearch: !!env.YOUTUBE_API_KEY, limits: { songSeconds: LIMITS.songSeconds, ytSeconds: LIMITS.ytSeconds, seats: LIMITS.seats, roomDays: LIMITS.roomTtl / DAY }, now: Date.now() });
+    return json({
+      ai: !!env.AI,
+      find: true,
+      ytSearch: !!env.YOUTUBE_API_KEY,
+      limits: { songSeconds: LIMITS.songSeconds, ytSeconds: LIMITS.ytSeconds, aiSeconds: LIMITS.aiSeconds, seats: LIMITS.seats, roomDays: LIMITS.roomTtl / DAY },
+      now: Date.now(),
+    });
   }
 
   // 곡·가사·유튜브 영상 찾기 (방과 상관없이 쓸 수 있다)
@@ -624,7 +654,19 @@ async function route(request, env, ctx) {
       expires = Date.now() + LIMITS.roomTtl;
     }
     if (body.extend) expires = Math.min(Date.now() + LIMITS.maxTtl, Math.max(expires, Date.now()) + LIMITS.roomTtl);
-    await db.batch([['UPDATE rooms SET settings = ?, expires_at = ?, title = ? WHERE code = ?', JSON.stringify(s), expires, title, code], bump(code)]);
+    // 가이드 영상의 위치 고치기 (영상과 MR이 어긋나 있을 때 방장이 나중에 맞춘다)
+    let songMeta = room.song_meta;
+    if (body.guideStart !== undefined || body.guideLoose !== undefined) {
+      const meta = JSON.parse(room.song_meta);
+      if (!meta.guide) fail(409, 'no_guide', '이 방에는 가이드 영상이 없어요.');
+      if (body.guideStart !== undefined) meta.guide.start = Math.round(num(body.guideStart, -600, 43200, meta.guide.start) * 1000) / 1000;
+      if (body.guideLoose !== undefined) {
+        if (body.guideLoose) meta.guide.loose = true;
+        else delete meta.guide.loose;
+      }
+      songMeta = JSON.stringify(meta);
+    }
+    await db.batch([['UPDATE rooms SET settings = ?, expires_at = ?, title = ?, song_meta = ? WHERE code = ?', JSON.stringify(s), expires, title, songMeta, code], bump(code)]);
     return json(await buildState(db, await getRoom(db, code), me));
   }
 
@@ -750,6 +792,7 @@ async function route(request, env, ctx) {
 
     if (seg[3] === 'align') {
       if (!room.song_blob) fail(409, 'no_song', '노래가 아직 올라가지 않았어요.');
+      if (songMeta.dur > LIMITS.aiSeconds) fail(413, 'too_long', 'AI 는 2분이 안 되는 구간만 들을 수 있어요. 탭으로 직접 맞춰 주세요.');
       const b64 = await getBlobBase64(db, code, room.song_blob);
       if (!b64) fail(409, 'no_song', '노래가 아직 올라가지 않았어요.');
       const language = /^[a-z]{2}$/.test(String(body.language || '')) ? body.language : undefined;

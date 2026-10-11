@@ -149,7 +149,7 @@ try {
   assert.equal(rows.length, 2);
   await shot(host, '51-find-results');
   await host.locator('.song-row').first().click();
-  await host.getByRole('heading', { name: '반주로 쓸 영상을 골라요' }).waitFor();
+  await host.getByRole('heading', { name: '반주와 원곡 영상을 골라요' }).waitFor();
   await host.getByText('가사를 찾았어요. 줄마다 타이밍도 들어 있어요 (8줄).').waitFor({ timeout: 15000 });
   const href = await host.getByRole('link', { name: '유튜브에서 이 곡 찾기' }).getAttribute('href');
   assert.equal(href, `https://www.youtube.com/results?search_query=${encodeURIComponent('떼창방 밴드 연습용 노래 audio')}`);
@@ -166,9 +166,10 @@ try {
 
   await host.locator('#yt-url').fill(`같이 부를 노래 https://youtu.be/${DEMO}?si=abc123`);
   await host.getByRole('button', { name: '확인' }).click();
-  await host.getByRole('heading', { name: '이 영상에 맞춰 부를까요?' }).waitFor({ timeout: 10000 });
-  await host.locator('.fake-yt').waitFor();
+  await host.locator('.fake-yt').waitFor({ timeout: 10000 });
   await host.getByText('떼창방 밴드 - 연습용 노래 (Official Audio)').waitFor();
+  // MR 파일 없이 영상만 고르면: 영상을 그대로 반주로 쓴다고 알려 준다
+  await host.getByText('MR 파일이 없으면 이 영상을 그대로 반주로 써요').waitFor();
   await shot(host, '53-source-video');
   await host.getByRole('button', { name: '다음: 부를 구간 고르기' }).click();
   await host.getByRole('heading', { name: '어디를 부를까요?' }).waitFor();
@@ -357,7 +358,7 @@ try {
   await linker.goto(BASE + '/new');
   await linker.locator('#yt-url').fill(`https://www.youtube.com/watch?v=${MV}`);
   await linker.getByRole('button', { name: '확인' }).click();
-  await linker.getByRole('heading', { name: '이 영상에 맞춰 부를까요?' }).waitFor({ timeout: 10000 });
+  await linker.locator('.fake-yt').waitFor({ timeout: 10000 });
   // 영상 제목으로 곡을 어림해서 가사 후보를 보여 준다
   assert.equal(await linker.locator('#lyr-q').inputValue(), '떼창방 밴드 - 연습용 노래');
   await linker.locator('.song-row').first().waitFor({ timeout: 15000 });
@@ -483,7 +484,7 @@ try {
   await tapper.locator('.toast-error').waitFor({ timeout: 10000 });
   assert.match(await tapper.locator('.toast-error').innerText(), /유튜브 밖에서 재생하지 못하게/);
   await tapper.locator('.yt-note-bad').waitFor();
-  assert.equal(await tapper.getByRole('heading', { name: '이 영상에 맞춰 부를까요?' }).count(), 1); // 그대로 이 단계에 머문다
+  assert.equal(await tapper.getByRole('heading', { name: '반주와 원곡 영상을 골라요' }).count(), 1); // 그대로 이 단계에 머문다
   await shot(tapper, '66-video-blocked');
   await tapper.getByRole('button', { name: '다른 영상으로 바꾸기' }).click();
   await tapper.locator('#yt-url').fill(`https://youtu.be/${DEMO}`);
@@ -557,7 +558,7 @@ try {
   assert.equal(await auto.locator('.song-row').count(), 1); // 같은 곡은 시간표 있는 쪽 하나만
   await shot(auto, '70-ai-rewrite');
   await auto.locator('.song-row').first().click();
-  await auto.getByRole('heading', { name: '이 영상에 맞춰 부를까요?' }).waitFor({ timeout: 15000 });
+  await auto.locator('.fake-yt').waitFor({ timeout: 15000 });
   await auto.getByText('가사를 찾았어요. 줄마다 타이밍도 들어 있어요 (8줄).').waitFor({ timeout: 15000 });
   assert.equal(await auto.evaluate(() => window.__ttbTest.players.at(-1).id), DEMO); // 라이브·뮤직비디오보다 음원 영상을 먼저 고른다
   assert.equal(await auto.locator('.alt-row').count(), 2);
@@ -580,7 +581,7 @@ try {
   // 휴대폰처럼 영상을 직접 눌러야 재생되는 브라우저: 다음으로 넘어갈 때 눌러 달라고 안내한다
   const shared = await newUser(browser, { blockAutoplay: true });
   await shared.goto(`${BASE}/new?text=${encodeURIComponent(`https://youtu.be/${DEMO}`)}`);
-  await shared.getByRole('heading', { name: '이 영상에 맞춰 부를까요?' }).waitFor({ timeout: 10000 });
+  await shared.getByRole('heading', { name: '반주와 원곡 영상을 골라요' }).waitFor({ timeout: 10000 });
   await shared.locator('.fake-yt').waitFor();
   await shared.getByRole('button', { name: '다음: 부를 구간 고르기' }).click();
   await shared.getByRole('button', { name: '영상이 재생되는지 확인하는 중…' }).waitFor();

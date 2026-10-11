@@ -2546,3 +2546,73 @@ input[type='search']::-webkit-search-cancel-button {
     transition-duration: 0.001ms !important;
   }
 }
+
+/* ───────── 방 만들기: MR 파일 + 원곡 영상(가이드) ───────── */
+.pick-card .card-title svg:last-child:not(:first-child) {
+  margin-left: auto;
+  color: var(--ok, #2bd576);
+}
+.pick-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.pick-row .song-text {
+  flex: 1;
+  min-width: 0;
+  margin-top: 0;
+}
+.pick-row .song-text strong {
+  overflow-wrap: anywhere;
+}
+.pick-row .btn {
+  flex: none;
+}
+.align-play {
+  display: flex;
+  gap: 8px;
+}
+.align-play .btn-primary {
+  flex: 1;
+}
+.shift-row.six {
+  grid-template-columns: repeat(6, 1fr);
+  gap: 4px;
+}
+.shift-row.six .btn {
+  padding-inline: 2px;
+  font-size: 13px;
+}
+@media (max-width: 359px) {
+  .shift-row.six {
+    grid-template-columns: repeat(3, 1fr);
+  }
+  .pick-row {
+    flex-wrap: wrap;
+  }
+}
+
+/* ───────── 녹음: 가이드 영상 ───────── */
+/* MR로 부르거나 들어보는 동안에는 가이드 영상을 치워 둔다 (멈춘 채로 자리만 비운다. 떼었다 붙이면 영상이 처음부터 다시 불러와진다) */
+.yt-frame.is-away {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+  overflow: hidden;
+  opacity: 0;
+  pointer-events: none;
+}
+.yt-caption {
+  margin-top: 6px;
+  color: var(--ink-3);
+  font-size: 13px;
+  font-weight: 600;
+  text-align: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.guide-card .seg-toggle {
+  margin-top: 2px;
+}

@@ -37,6 +37,15 @@ export interface YtRef {
   author: string;
 }
 
+/**
+ * 가이드 영상: 반주(MR) 파일로 부르는 방에 붙여 둔 원곡 영상. 녹음할 때 보고 들으며 따라 부른다.
+ * start 는 MR 구간의 0초가 영상의 몇 초인지 (음수일 수도 있다).
+ */
+export interface GuideRef extends YtRef {
+  /** 영상과 MR이 딱 맞지 않아서, 따라 부르기에는 못 쓰고 미리 듣기로만 쓰는 경우 */
+  loose?: boolean;
+}
+
 export interface SongMeta {
   blob: string | null;
   dur: number;
@@ -48,14 +57,17 @@ export interface SongMeta {
   bpm: number;
   beat0: number;
   demo: boolean;
+  /** 유튜브 영상을 반주로 쓰는 방 (음원 파일이 없다) */
   yt?: YtRef;
+  /** 반주 파일로 부르는 방에 붙인 원곡 영상 */
+  guide?: GuideRef;
 }
 
 export interface ServerConfig {
   ai: boolean;
   /** 가수·곡 이름으로 유튜브 영상까지 자동으로 찾을 수 있는지 (서버에 YouTube API 열쇠가 있을 때) */
   ytSearch?: boolean;
-  limits: { songSeconds: number; ytSeconds?: number; seats: number; roomDays: number };
+  limits: { songSeconds: number; ytSeconds?: number; aiSeconds?: number; seats: number; roomDays: number };
   now: number;
 }
 
@@ -189,7 +201,7 @@ export const api = {
   setMe: (code: string, who: Identity, body: { name?: string; seat?: number | null }) => request<Room>('POST', `/rooms/${code}/me`, { who, body }),
   putSong: (code: string, who: Identity, bytes: Uint8Array) => request<Room>('PUT', `/rooms/${code}/song`, { who, bin: bytes }),
   putParts: (code: string, who: Identity, lines: Line[], seatCount: number) => request<Room>('PUT', `/rooms/${code}/parts`, { who, body: { lines, seatCount } }),
-  putSettings: (code: string, who: Identity, body: { draft?: false; blind?: boolean; revealed?: boolean; extend?: boolean; title?: string }) =>
+  putSettings: (code: string, who: Identity, body: { draft?: false; blind?: boolean; revealed?: boolean; extend?: boolean; title?: string; guideStart?: number; guideLoose?: boolean }) =>
     request<Room>('PUT', `/rooms/${code}/settings`, { who, body }),
   release: (code: string, who: Identity, seat: number) => request<Room>('POST', `/rooms/${code}/release`, { who, body: { seat } }),
   deleteRoom: (code: string, who: Identity) => request<{ ok: true }>('DELETE', `/rooms/${code}`, { who }),

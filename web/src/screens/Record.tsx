@@ -30,8 +30,10 @@ interface Review {
   reported: number;
   fin: FinalTake & { processed: Float32Array };
   sampleRate: number;
-  /** 유튜브 반주일 때: 부르는 동안 영상이 멈칫했는지 */
+  /** 영상을 틀고 부른 녹음일 때: 부르는 동안 영상이 멈칫했는지 */
   shaky?: boolean;
+  /** MR 방에서 원곡 영상(가이드)을 따라 부른 녹음인지 */
+  guide?: boolean;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -51,17 +53,25 @@ export function Record({ code }: { code: string }) {
   // 유튜브 영상을 반주로 쓰는 방: 영상은 플레이어가 틀고, 싱크는 영상 시계를 따라 잡는다
   const ytRef = room?.song.yt;
   const isYt = !!ytRef;
-  const yt = useYtPlayer(ytRef?.id);
+  // MR 파일로 부르는 방에 붙은 원곡 영상(가이드): 영상을 보고 들으며 부르고, 목소리는 MR 시간에 맞춰 얹는다
+  const guide = isYt ? undefined : room?.song.guide;
+  const hasGuide = !!guide;
+  const yt = useYtPlayer(ytRef?.id ?? guide?.id);
   const ytPlayerRef = useRef<YtPlayer | null>(null);
   ytPlayerRef.current = yt.player;
   const [ytTap, setYtTap] = useState(false);
   const [rollReady, setRollReady] = useState(false);
   const [stageSinging, setStageSinging] = useState(false);
+  const [previewing, setPreviewing] = useState(false);
   const micRef = useRef<Mic | null>(null);
+  /** 반주를 트는 재생기. 유튜브 반주 방에서는 영상 재생기(YtDeck), 파일 반주 방에서는 Transport. */
   const tRef = useRef<Transport | YtDeck | null>(null);
+  /** 가이드 영상용 재생기 (파일 반주 방에서만). 들어보기와 MR 반주는 tRef 가 맡는다. */
+  const gRef = useRef<YtDeck | null>(null);
   const songRef = useRef<AudioBuffer | null>(null);
   const othersRef = useRef<PlayTake[]>([]);
-  const rollRef = useRef<{ pass: Pass; plan: PassPlan; tZero: number } | null>(null);
+  /** deck: 이번 녹음에서 영상을 틀었다면 그 재생기 (영상 시계로 싱크를 잡는다) */
+  const rollRef = useRef<{ pass: Pass; plan: PassPlan; tZero: number; deck: YtDeck | null } | null>(null);
   const meterRef = useRef<HTMLDivElement>(null);
   const wakeRef = useRef<{ release: () => Promise<void> } | null>(null);
   const roomRef = useRef<Room | null>(room);
@@ -97,6 +107,9 @@ export function Record({ code }: { code: string }) {
     window.clearTimeout(watchdog.current);
     tRef.current?.dispose();
     tRef.current = null;
+    gRef.current?.dispose();
+    gRef.current = null;
+    setPreviewing(false);
     micRef.current?.close();
     micRef.current = null;
     void wakeRef.current?.release().catch(() => {});
@@ -136,11 +149,49 @@ export function Record({ code }: { code: string }) {
       }
     } else if (e.type === 'paused' || e.type === 'failed') {
       setRevPlaying(false);
-      if (e.type === 'failed' && phaseRef.current === 'review') toast(e.error.message, 'error');
+      setPreviewing(false);
+      if (e.type === 'failed' && (phaseRef.current === 'review' || phaseRef.current === 'ready' || phaseRef.current === 'saved')) toast(e.error.message, 'error');
     }
   };
   const deckEventRef = useRef(onDeckEvent);
   deckEventRef.current = onDeckEvent;
+
+  // ───────── 가이드 영상 (MR 방) ─────────
+  /** 원곡 영상을 따라 부르기로 골랐는지 / 지금 그렇게 할 수 있는지 (영상이 열려 있어야 한다) */
+  const followWanted = hasGuide && !guide!.loose && pref.monitor === 'guide';
+  const followGuide = followWanted && !!yt.player && !yt.error;
+
+  /** 가이드 영상 재생기. 마이크와 같은 소리 시계를 쓴다. 영상이 아직 안 열렸으면 null. */
+  const ensureGuide = (): YtDeck | null => {
+    const g = roomRef.current?.song.guide;
+    const mic = micRef.current;
+    const player = ytPlayerRef.current;
+    if (!g || roomRef.current?.song.yt || !mic || !player) return null;
+    const cur = gRef.current;
+    // 방장이 영상 위치를 고쳤으면 새로 만든다
+    if (cur && cur.yt === player && cur.ctx === mic.ctx && cur.seg.start === g.start) return cur;
+    cur?.dispose();
+    const d = new YtDeck(mic.ctx, player, { start: g.start, dur: roomRef.current!.song.dur, len: g.len });
+    d.on((e) => deckEventRef.current(e));
+    gRef.current = d;
+    return d;
+  };
+
+  /** 녹음하기 전에, 내가 부를 부분을 원곡으로 들어 본다 */
+  const togglePreview = () => {
+    const r = roomRef.current;
+    if (previewing) {
+      gRef.current?.stop();
+      return setPreviewing(false);
+    }
+    const d = ensureGuide();
+    if (!d || !r || !current) return toast(yt.error?.message || '원곡 영상을 불러오는 중이에요. 잠시 뒤에 다시 눌러 주세요.', 'error');
+    tRef.current?.stop();
+    d.setTakes([]);
+    d.setMix({ backing: Math.min(1, pref.guide), seats: {}, echo: 0 });
+    setPreviewing(true);
+    d.play(Math.max(-d.seg.start, current.t0 - 2), { until: Math.min(r.song.dur, current.t1 + 1), withTakes: false, onEnd: () => setPreviewing(false) }).catch(() => {});
+  };
 
   // ───────── 마이크 켜기 ─────────
   const openMic = async (next = pref) => {
@@ -233,7 +284,9 @@ export function Record({ code }: { code: string }) {
     setCalib({ open: true, state: 'running' });
     try {
       tRef.current?.stop();
+      gRef.current?.stop();
       setRevPlaying(false);
+      setPreviewing(false);
       const r = await runCalibration(mic);
       if (r.ok) {
         rememberLatency(r.sec, reportedLatency(mic.ctx, mic.inputLatency));
@@ -242,7 +295,8 @@ export function Record({ code }: { code: string }) {
         const cur = reviewRef.current;
         if (cur && phaseRef.current === 'review') {
           const fin = await finishTake(cutTake(cur.raw, r.sec));
-          setNudge(0);
+          // 가이드를 따라 부른 녹음은 영상 쪽 어긋남이 따로 있어서, 기억해 둔 만큼은 그대로 옮겨 둔다
+          setNudge(cur.guide ? store.guideBias(code) : 0);
           setReview({ ...cur, choice: { sec: r.sec, source: 'measured' }, fin });
         }
       } else {
@@ -262,23 +316,28 @@ export function Record({ code }: { code: string }) {
     const hear = pref.hearOthers && othersRef.current.length > 0;
     window.clearTimeout(nudgeTimer.current);
     window.clearTimeout(watchdog.current);
-    if (t instanceof YtDeck) {
+    setPreviewing(false);
+    // 영상을 틀고 부르는 경우: 유튜브 반주 방이거나, MR 방에서 원곡 영상(가이드)을 따라 부를 때
+    const deck = t instanceof YtDeck ? t : followGuide ? ensureGuide() : null;
+    if (deck) {
       // 영상은 누른 그 순간에 시작시켜야 한다 (휴대폰 브라우저는 누른 직후에만 재생을 허락한다)
-      const plan = planPass(current, r.song.dur, t.seg);
-      t.setTakes(hear ? othersRef.current : []);
-      t.setMix({ backing: pref.guide, seats: {}, echo: 0.1 });
+      if (deck !== t) t.stop(); // 가이드 영상에 원곡 반주가 들어 있으므로 MR은 틀지 않는다
+      const plan = planPass(current, r.song.dur, deck.seg);
+      deck.setTakes(hear ? othersRef.current : []);
+      deck.setMix({ backing: pref.guide, seats: {}, echo: 0.1 });
       const seq = ++rollSeq.current;
       mic.start();
       setRollReady(false);
-      rollRef.current = { pass: current, plan, tZero: NaN };
-      t.play(plan.from, { until: plan.until, withTakes: hear, onEnd: () => void finishPass(seq) }).catch(() => {
+      rollRef.current = { pass: current, plan, tZero: NaN, deck };
+      deck.play(plan.from, { until: plan.until, withTakes: hear, onEnd: () => void finishPass(seq) }).catch(() => {
         /* 실패는 재생기 알림(failed)으로 처리한다 */
       });
       // 영상이 시작되기를 기다리는 시간까지 넉넉히 잡은 안전장치
       watchdog.current = window.setTimeout(() => void finishPass(seq), (plan.until - plan.from + 150) * 1000);
     } else {
       const song = songRef.current;
-      if (!song) return;
+      if (!song || t instanceof YtDeck) return;
+      gRef.current?.stop();
       try {
         await mic.ctx.resume();
       } catch {
@@ -291,7 +350,7 @@ export function Record({ code }: { code: string }) {
       const seq = ++rollSeq.current;
       mic.start();
       const tZero = t.play(plan.from, { until: plan.until, countIn: plan.countIn, withTakes: hear, onEnd: () => void finishPass(seq) });
-      rollRef.current = { pass: current, plan, tZero };
+      rollRef.current = { pass: current, plan, tZero, deck: null };
       setRollReady(true);
       // 재생 끝 신호를 놓쳐도 녹음 화면에 갇히지 않게 하는 안전장치
       watchdog.current = window.setTimeout(() => void finishPass(seq), (plan.until - plan.from + 2.5) * 1000);
@@ -313,11 +372,12 @@ export function Record({ code }: { code: string }) {
     const mic = micRef.current;
     const roll = rollRef.current;
     const song = songRef.current;
-    const deck = tRef.current instanceof YtDeck ? tRef.current : null;
-    // 유튜브 반주: 부르는 동안 잰 "영상 시계 ↔ 소리 시계" 값을 멈추기 전에 받아 둔다 (줄마다 따로)
+    const deck = roll?.deck ?? null;
+    // 영상을 틀고 불렀으면: 부르는 동안 잰 "영상 시계 ↔ 소리 시계" 값을 멈추기 전에 받아 둔다 (줄마다 따로)
     const fit = deck && roll ? deck.zerosFor(roll.pass.lines.map((l) => [l.t0, l.t1])) : null;
     const stalls = deck ? deck.stalls : 0;
     tRef.current?.stop();
+    gRef.current?.stop();
     if (!mic || !roll || (!song && !deck)) return setPhase('ready');
     phaseRef.current = 'processing';
     setPhase('processing');
@@ -342,10 +402,12 @@ export function Record({ code }: { code: string }) {
       const choice = chooseLatency(est, reported);
       const fin = await finishTake(cutTake(raw, choice.sec));
       if (!aliveRef.current) return;
+      // MR 방에서 가이드 영상을 따라 부른 녹음: 영상 소리와 우리 소리의 어긋남을 이 방에서 맞춰 둔 만큼 옮겨서 시작한다
+      const viaGuide = !!deck && deck === gRef.current;
       // 자동으로 잰 경우에는 지난번에 일부러 옮겨 둔 만큼을 막대 시작 위치로 쓴다
-      const startNudge = choice.source === 'measured' ? userBias() : 0;
+      const startNudge = viaGuide ? store.guideBias(code) : choice.source === 'measured' ? userBias() : 0;
       setNudge(startNudge);
-      setReview({ raw, choice, reported, fin, sampleRate: capture.sampleRate, shaky: !!fit && (fit.spread > YT_SPREAD_MAX || stalls > 0) });
+      setReview({ raw, choice, reported, fin, sampleRate: capture.sampleRate, shaky: !!fit && (fit.spread > YT_SPREAD_MAX || stalls > 0), guide: viaGuide });
       setPhase('review');
       void playReview(fin, startNudge, capture.sampleRate, roll.pass);
     } catch {
@@ -358,6 +420,7 @@ export function Record({ code }: { code: string }) {
     rollSeq.current++;
     window.clearTimeout(watchdog.current);
     tRef.current?.stop();
+    gRef.current?.stop();
     await micRef.current?.stop();
     void wakeRef.current?.release().catch(() => {});
     setPhase('ready');
@@ -424,7 +487,10 @@ export function Record({ code }: { code: string }) {
       );
       const saved = out.room.takes.find((t) => t.id === out.takeId);
       if (saved && tRef.current) seedAudio(saved.blob, toBuffer(tRef.current.ctx, fin.processed, review.sampleRate));
-      if (review.choice.source === 'measured') {
+      if (review.guide) {
+        // 가이드를 따라 부른 녹음에서 옮긴 값은 영상 쪽 어긋남이라, MR로 부를 때 쓰는 값과 섞지 않고 방별로 따로 기억한다
+        store.setGuideBias(code, nudge);
+      } else if (review.choice.source === 'measured') {
         // 잰 값은 그대로 기억하고, 사용자가 옮긴 만큼은 취향으로 따로 기억한다
         rememberLatency(review.choice.sec, review.reported);
         setUserBias(nudge);
@@ -491,27 +557,43 @@ export function Record({ code }: { code: string }) {
   }
   const others = audibleTakes(room).filter((t) => t.seat !== seat).length;
   const rolling = phase === 'rolling' && !!rollRef.current && !!tRef.current;
-  const backing = isYt ? '영상' : '반주';
+  /** 이번 녹음에서 영상을 틀고 있는지 (유튜브 반주 방이거나, 가이드 영상을 따라 부르는 중) */
+  const videoRoll = rolling && !!rollRef.current?.deck;
+  /** 녹음할 때 영상을 틀게 되는지 (안내 문구용) */
+  const withVideo = isYt || followWanted;
+  const backing = isYt ? '영상' : followWanted ? '원곡 영상' : '반주';
+  // 가이드 영상은 준비 화면과 따라 부르는 동안에만 보인다. MR로 부르거나 들어보는 동안에는 치워 둔다 (그동안 영상은 멈춰 있다).
+  const guideAway = hasGuide && (rolling ? !videoRoll : phase === 'processing' || phase === 'review' || phase === 'saving');
 
   // 유튜브 플레이어는 단계가 바뀌어도 같은 자리에 그대로 둔다 (자리를 옮기면 영상이 처음부터 다시 불러와진다).
   // 그래서 녹음 무대와 나머지 화면이 같은 틀(main)을 쓰고, 영상의 위치는 CSS 로만 바꾼다.
   return (
-    <main className={rolling ? `stage${isYt ? ' has-video' : ''}${stageSinging ? ' is-singing' : ''}` : 'page record'} style={style}>
-      {isYt && phase !== 'done' && (
-        <YtFrame yt={yt} note={!rolling && ytTap ? <YtTapNote /> : null} />
+    <main className={rolling ? `stage${videoRoll ? ' has-video' : ''}${stageSinging ? ' is-singing' : ''}` : 'page record'} style={style}>
+      {(isYt || hasGuide) && phase !== 'done' && (
+        <YtFrame
+          yt={yt}
+          className={guideAway ? 'is-away' : ''}
+          note={
+            !rolling && ytTap ? (
+              <YtTapNote />
+            ) : hasGuide && !rolling && !guideAway && !yt.error ? (
+              <p className="yt-caption">원곡 영상 (가이드){guide!.title ? ` · ${guide!.title}` : ''}</p>
+            ) : null
+          }
+        />
       )}
       {rolling ? (
         <Stage
           room={room}
           roll={rollRef.current!}
-          getPosition={() => tRef.current?.position() ?? 0}
+          getPosition={() => (rollRef.current?.deck ?? tRef.current)?.position() ?? 0}
           meterRef={meterRef}
           passLabel={`${(passIndex ?? 0) + 1} / ${passes.length}`}
           onCancel={abortPass}
           onSinging={setStageSinging}
           ready={rollReady}
-          tapHint={isYt && ytTap}
-          video={isYt}
+          tapHint={videoRoll && ytTap}
+          video={videoRoll}
         />
       ) : (
         <>
@@ -523,7 +605,8 @@ export function Record({ code }: { code: string }) {
               <p className="lead">
                 {passes.length > 1 ? `내 파트는 ${passes.length}번에 나눠 녹음해요. ` : ''}
                 {backing}
-                {isYt ? '이' : '가'} 4초 먼저 나오고, 내 차례가 되면 가사에 색이 들어와요.
+                {withVideo ? '이' : '가'} 4초 먼저 나오고, 내 차례가 되면 가사에 색이 들어와요.
+                {followWanted ? ' 영상 속 가수를 따라 부르면 되고, 녹음한 목소리는 MR 위에 얹혀요.' : ''}
               </p>
               <div className="choice-list" role="radiogroup" aria-label="듣는 방법">
                 <button className={`choice${pref.earphones ? ' is-on' : ''}`} role="radio" aria-checked={pref.earphones} onClick={() => changePref({ earphones: true })}>
@@ -538,7 +621,8 @@ export function Record({ code }: { code: string }) {
                   <span>
                     <strong>이어폰 없이 할게요</strong>
                     <small>스피커 {backing}
-                      {isYt ? ' 소리' : ''}가 같이 녹음되지 않게 걸러 줘요. 목소리가 조금 뭉개질 수 있어요.</small>
+                      {withVideo ? ' 소리' : ''}가 같이 녹음되지 않게 걸러 줘요. 목소리가 조금 뭉개질 수 있어요.
+                      {followWanted ? ' 원곡 가수의 목소리가 조금 섞여 녹음될 수 있어서 이어폰을 권해요.' : ''}</small>
                   </span>
                 </button>
               </div>
@@ -595,13 +679,48 @@ export function Record({ code }: { code: string }) {
                 ))}
               </ol>
 
+              {hasGuide && (
+                <div className="card guide-card">
+                  <h3 className="card-title">
+                    <Icon name="video" size={20} /> 녹음할 때 들을 소리
+                  </h3>
+                  {guide!.loose ? (
+                    <p className="hint">이 방의 원곡 영상은 MR과 딱 맞지 않아서 미리 듣기로만 써요. 녹음은 MR을 들으면서 해요.</p>
+                  ) : yt.error ? (
+                    <p className="pill pill-bad">원곡 영상을 열 수 없어서 MR만 들으며 녹음해요.</p>
+                  ) : (
+                    <>
+                      <div className="seg-toggle" role="group" aria-label="녹음할 때 들을 소리">
+                        <button className={pref.monitor === 'guide' ? 'is-on' : ''} aria-pressed={pref.monitor === 'guide'} onClick={() => changePref({ monitor: 'guide' })}>
+                          원곡 따라 부르기
+                        </button>
+                        <button className={pref.monitor === 'mr' ? 'is-on' : ''} aria-pressed={pref.monitor === 'mr'} onClick={() => changePref({ monitor: 'mr' })}>
+                          MR만 듣고 부르기
+                        </button>
+                      </div>
+                      <p className="hint">
+                        {pref.monitor === 'guide'
+                          ? '원곡 영상을 보고 들으면서 가수와 같은 타이밍에 불러요. 녹음한 목소리는 MR 위에 얹혀요.'
+                          : '반주만 들으면서 불러요. 원곡은 아래 버튼으로 미리 들어 볼 수 있어요.'}
+                      </p>
+                    </>
+                  )}
+                  {!yt.error && (
+                    <button className="btn btn-secondary" onClick={togglePreview} disabled={!yt.player || !current}>
+                      <Icon name={previewing ? 'pause' : 'play'} size={18} />
+                      {previewing ? '멈추기' : yt.player ? '원곡으로 내 파트 미리 듣기' : '원곡 영상을 불러오는 중…'}
+                    </button>
+                  )}
+                </div>
+              )}
+
               <details className="card options">
                 <summary>소리 설정</summary>
                 <label className="field">
-                  <span>{isYt ? '영상 소리 크기' : '반주 크기'}</span>
+                  <span>{isYt ? '영상 소리 크기' : followWanted ? '원곡 영상·반주 크기' : '반주 크기'}</span>
                   <input id="guide-vol" type="range" min={0.2} max={isYt ? 1 : 1.4} step={0.05} value={Math.min(pref.guide, isYt ? 1 : 1.4)} onChange={(e) => changePref({ guide: Number(e.target.value) })} />
                 </label>
-                {isYt && isIOS() && <p className="hint">아이폰·아이패드에서는 영상 소리 크기가 기기 음량을 따라가요.</p>}
+                {withVideo && isIOS() && <p className="hint">아이폰·아이패드에서는 영상 소리 크기가 기기 음량을 따라가요.</p>}
                 {others > 0 && <Toggle id="hear-others" checked={pref.hearOthers} onChange={(v) => changePref({ hearOthers: v })} label="친구들 녹음도 같이 듣기" hint="먼저 녹음한 친구 목소리에 맞춰 부를 수 있어요." />}
                 {devices.length > 1 && (
                   <label className="field">
@@ -628,9 +747,14 @@ export function Record({ code }: { code: string }) {
               </details>
 
               <div className="bottom-bar">
-                <button className="btn btn-rec btn-xl" onClick={startPass} disabled={!current}>
+                {/* 원곡을 따라 부르기로 했는데 영상이 아직 안 열렸으면 잠깐 기다린다 (영상이 열리지 않으면 MR로 넘어간다) */}
+                <button className="btn btn-rec btn-xl" onClick={startPass} disabled={!current || (followWanted && !yt.player && !yt.error)}>
                   <span className="rec-dot" />
-                  {current && recorded[passIndex ?? 0] ? `${(passIndex ?? 0) + 1}번 다시 녹음하기` : `${(passIndex ?? 0) + 1}번 녹음 시작`}
+                  {followWanted && !yt.player && !yt.error
+                    ? '원곡 영상을 불러오는 중…'
+                    : current && recorded[passIndex ?? 0]
+                      ? `${(passIndex ?? 0) + 1}번 다시 녹음하기`
+                      : `${(passIndex ?? 0) + 1}번 녹음 시작`}
                 </button>
               </div>
             </section>
@@ -681,7 +805,7 @@ export function Record({ code }: { code: string }) {
                   </button>
                 </div>
                 <p className="hint">
-                  목소리가 {backing}보다 늦게 들리면 왼쪽(빠르게), 앞서 나가면 오른쪽(늦게)으로 옮겨요. 한 번 맞추면 다음 녹음부터 그대로 적용돼요.
+                  목소리가 {isYt ? '영상' : '반주'}보다 늦게 들리면 왼쪽(빠르게), 앞서 나가면 오른쪽(늦게)으로 옮겨요. 한 번 맞추면 다음 녹음부터 그대로 적용돼요.
                 </p>
                 {review.choice.source !== 'measured' && pref.earphones && phase === 'review' && (
                   <button className="btn btn-secondary" onClick={() => setCalib({ open: true, state: 'idle' })}>
@@ -752,6 +876,7 @@ export function Record({ code }: { code: string }) {
 }
 
 function reviewMessage(r: Review, yt: boolean): string {
+  if (r.guide) return '원곡을 따라 부른 목소리를 MR 위에 얹었어요. 반주와 어긋나게 들리면 아래 막대로 맞춰 주세요. 한 번 맞추면 이 방에서는 다음 녹음부터 그대로 적용돼요.';
   if (r.choice.source === 'measured') return '싱크는 자동으로 맞췄어요. 괜찮으면 저장하고, 어긋나면 아래 막대로 맞춰 주세요.';
   if (r.choice.source === 'remembered') return '지난번에 맞춘 싱크를 그대로 썼어요. 어긋나면 아래 막대로 맞춰 주세요.';
   if (yt) return '영상과 목소리가 어긋나게 들리면 아래 막대로 맞춰 주세요. 유튜브 영상은 싱크를 자동으로 잴 수 없어서, 처음 한 번은 직접 맞춰야 해요.';

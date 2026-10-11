@@ -27,7 +27,7 @@ async function newPage(browser, initScript) {
   const page = await context.newPage();
   pages.push(page);
   page.on('pageerror', (e) => console.log('   [page error]', e.message));
-  page.on('console', (m) => m.type() === 'error' && !/favicon|40[34]/.test(m.text()) && console.log('   [console]', m.text()));
+  page.on('console', (m) => m.type() === 'error' && !/favicon|40[34]|ERR_FAILED|net::/.test(m.text()) && console.log('   [console]', m.text()));
   return page;
 }
 
@@ -49,6 +49,12 @@ try {
     return btoa(s);
   });
   await host.locator('#song-file').setInputFiles({ name: '우리 노래_최종.wav', mimeType: 'audio/wav', buffer: Buffer.from(wavB64, 'base64') });
+  // 파일을 고르면 "반주와 원곡 영상" 화면에 MR 파일로 올라가 있다. 원곡 영상 없이 MR만으로 간다.
+  await host.getByRole('heading', { name: '반주와 원곡 영상을 골라요' }).waitFor({ timeout: 20000 });
+  assert.match(await host.locator('#pick-mr').innerText(), /우리 노래_최종\.wav[\s\S]*0:24/);
+  await host.getByText('원곡 영상 없이 MR만으로도 만들 수 있어요').waitFor();
+  await shot(host, '19-source-mr-only');
+  await host.getByRole('button', { name: '다음: 부를 구간 고르기' }).click();
   await host.getByRole('heading', { name: '부를 구간을 골라요' }).waitFor({ timeout: 20000 });
   await shot(host, '20-trim');
   await host.getByRole('button', { name: '전체' }).click();

@@ -25,7 +25,7 @@ type Phase = 'idle' | 'starting' | 'playing' | 'stalled';
 
 interface TestHooks {
   /** 목소리를 영상에 맞춰 깔 때마다 알려 준다 (자동 테스트가 싱크를 확인하는 자리) */
-  onYtVoices?: (info: { tZero: number; from: number; segStart: number }) => void;
+  onYtVoices?: (info: { tZero: number; from: number; segStart: number; starts: number[] }) => void;
 }
 const hooks = () => (window as unknown as { __ttbTest?: TestHooks }).__ttbTest;
 
@@ -291,7 +291,7 @@ export class YtDeck implements Deck {
     const from = Math.max(0, this.pos() + lookahead);
     scheduleTakes(this.ctx, this.graph, this.mix, this.takes, k, from, this.sources);
     this.scheduledZero = k;
-    hooks()?.onYtVoices?.({ tZero: k, from, segStart: this.seg.start });
+    hooks()?.onYtVoices?.({ tZero: k, from, segStart: this.seg.start, starts: this.takes.map((t) => t.start) });
   }
 
   private stopVoices(): void {

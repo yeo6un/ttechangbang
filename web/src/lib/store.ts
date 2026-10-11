@@ -18,6 +18,15 @@ function write(key: string, value: unknown): void {
   }
 }
 
+export interface MicPrefs {
+  earphones: boolean;
+  deviceId: string;
+  /** 반주(또는 영상) 소리 크기 */
+  guide: number;
+  hearOthers: boolean;
+  monitor: 'guide' | 'mr';
+}
+
 export interface RecentRoom {
   code: string;
   title: string;
@@ -37,6 +46,7 @@ export const store = {
     try {
       localStorage.removeItem(idKey(code));
       localStorage.removeItem(`ttb.mix.${code}`);
+      localStorage.removeItem(`ttb.gbias.${code}`);
     } catch {
       /* 무시 */
     }
@@ -53,14 +63,16 @@ export const store = {
   name: (): string => read<string>('ttb.name', ''),
   setName: (name: string) => write('ttb.name', name),
 
-  mic: (): { earphones: boolean; deviceId: string; guide: number; hearOthers: boolean } => ({
+  /** monitor: 가이드 영상이 붙은 방에서 녹음할 때 무엇을 들을지 (원곡 영상 / MR 반주) */
+  mic: (): MicPrefs => ({
     earphones: true,
     deviceId: '',
     guide: 0.8,
     hearOthers: true,
+    monitor: 'guide',
     ...read<object>('ttb.mic', {}),
   }),
-  setMic: (v: Partial<{ earphones: boolean; deviceId: string; guide: number; hearOthers: boolean }>) => write('ttb.mic', { ...store.mic(), ...v }),
+  setMic: (v: Partial<MicPrefs>) => write('ttb.mic', { ...store.mic(), ...v }),
 
   mix: (code: string, yt = false): MixSettings => ({ ...(yt ? DEFAULT_YT_MIX : DEFAULT_MIX), ...read<Partial<MixSettings>>(`ttb.mix.${code}`, {}) }),
   setMix: (code: string, mix: MixSettings) => write(`ttb.mix.${code}`, mix),
@@ -71,4 +83,19 @@ export const store = {
     return Number.isFinite(v) ? Math.max(-300, Math.min(300, v)) : 0;
   },
   setYtShift: (ms: number) => write('ttb.ytshift', ms),
+
+  /**
+   * 원곡 영상을 따라 부른 녹음을 MR에 얹을 때 이 기기에서 옮겨 주는 값(ms).
+   * 영상 소리와 우리 소리가 나오는 빠르기가 기기마다 조금 다르고, 방마다 영상과 MR을 맞춘 정도도 달라서
+   * 방별로 기억한다. 처음 가는 방에서는 이 기기에서 마지막으로 쓴 값부터 시작한다.
+   */
+  guideBias: (code: string): number => {
+    const v = Number(read<number | null>(`ttb.gbias.${code}`, null) ?? read<number>('ttb.gbias', 0));
+    return Number.isFinite(v) ? Math.max(-300, Math.min(300, Math.round(v / 10) * 10)) : 0;
+  },
+  setGuideBias(code: string, ms: number) {
+    write(`ttb.gbias.${code}`, ms);
+    // 크게 옮긴 값은 그 방의 영상과 MR이 어긋나 있어서일 가능성이 높으므로, 다른 방의 시작값으로는 쓰지 않는다
+    if (Math.abs(ms) <= 80) write('ttb.gbias', ms);
+  },
 };

@@ -249,8 +249,9 @@ try {
     const bad = await call('POST', '/api/rooms', { body: { title: 'x', hostName: 'h', song: { dur: 200, yt: { id: 'nope' } } } });
     assert.equal(bad.status, 400);
     assert.equal(bad.data.error.code, 'bad_video');
-    // 파일 방은 여전히 125초까지만
-    assert.equal((await call('POST', '/api/rooms', { body: { title: 'x', hostName: 'h', song: { dur: 200 } } })).data.room.song.dur, 125);
+    // 파일(MR) 방도 한 곡 전체 길이까지 된다
+    assert.equal((await call('POST', '/api/rooms', { body: { title: 'x', hostName: 'h', song: { dur: 200 } } })).data.room.song.dur, 200);
+    assert.equal((await call('POST', '/api/rooms', { body: { title: 'x', hostName: 'h', song: { dur: 900 } } })).data.room.song.dur, 330);
     const r = await call('POST', '/api/rooms', {
       body: { title: '연습용 노래', hostName: '방장', seatCount: 2, song: { dur: 200, name: '연습용 노래', artist: '떼창방 밴드', art: 'https://evil.example/x.jpg', yt: { id: 'https://youtu.be/ttbDEMO0001?t=3', start: 12.3456, len: 215, title: '영상 제목', author: '채널' } } },
     });
@@ -272,6 +273,50 @@ try {
     // 받아쓰기 AI 는 저장된 음원이 있어야 해서 이 방에서는 쓸 수 없다
     assert.ok([409, 501].includes((await call('POST', `/api/rooms/${y.code}/ai/align`, { member: y.member, body: {} })).status));
     await call('DELETE', `/api/rooms/${y.code}`, { member: y.member });
+  });
+
+  // ───────── MR 파일로 부르고, 원곡 영상을 가이드로 붙인 방 ─────────
+  await step('가이드 영상: MR 방에 원곡 영상을 붙이고, 방장이 나중에 위치를 고칠 수 있다', async () => {
+    const bad = await call('POST', '/api/rooms', { body: { title: 'x', hostName: 'h', song: { dur: 60, guide: { id: 'nope' } } } });
+    assert.equal(bad.status, 400);
+    assert.equal(bad.data.error.code, 'bad_video');
+    const r = await call('POST', '/api/rooms', {
+      body: { title: '가이드 방', hostName: '방장', seatCount: 2, song: { dur: 180.5, name: 'practice (inst).mp3', guide: { id: 'https://www.youtube.com/watch?v=ttbMV000001', start: -1.23456, len: 215.4, title: '원곡 영상', author: '채널', extra: 'x' } } },
+    });
+    assert.equal(r.status, 201);
+    const g = r.data;
+    // MR 앞부분이 영상보다 길면 시작 위치가 음수가 될 수 있다
+    assert.deepEqual(g.room.song.guide, { id: 'ttbMV000001', start: -1.235, len: 215, title: '원곡 영상', author: '채널' });
+    assert.equal(g.room.song.yt, undefined);
+    assert.equal(g.room.song.dur, 180.5);
+    // 반주 파일이 올라와야 방을 열 수 있다 (영상은 가이드일 뿐이다)
+    assert.equal((await call('PUT', `/api/rooms/${g.code}/settings`, { member: g.member, body: { draft: false } })).status, 409);
+    const up = await call('PUT', `/api/rooms/${g.code}/song`, { member: g.member, bin: fakeAudio(700_000, 5) });
+    assert.equal(up.status, 200);
+    assert.ok(up.data.song.blob);
+    assert.equal(up.data.song.guide.id, 'ttbMV000001');
+    const open = await call('PUT', `/api/rooms/${g.code}/settings`, { member: g.member, body: { draft: false } });
+    assert.equal(open.data.draft, false);
+    // 올린 파일이 그대로 돌아온다 (여러 조각으로 나뉘어 저장된다)
+    const back = await call('GET', `/api/rooms/${g.code}/blobs/${up.data.song.blob}`, { member: g.member });
+    assert.equal(back.data.length, 700_000);
+    assert.deepEqual([...back.data.subarray(449_990, 450_010)], [...fakeAudio(700_000, 5).subarray(449_990, 450_010)]);
+    // 가이드 위치 고치기·미리 듣기 전용으로 바꾸기는 방장만
+    const friend = (await call('POST', `/api/rooms/${g.code}/join`, { body: { name: '친구' } })).data.member;
+    assert.equal((await call('PUT', `/api/rooms/${g.code}/settings`, { member: friend, body: { guideStart: 3 } })).status, 403);
+    const moved = await call('PUT', `/api/rooms/${g.code}/settings`, { member: g.member, body: { guideStart: 4.56789, guideLoose: true } });
+    assert.deepEqual(moved.data.song.guide, { id: 'ttbMV000001', start: 4.568, len: 215, title: '원곡 영상', author: '채널', loose: true });
+    const tight = await call('PUT', `/api/rooms/${g.code}/settings`, { member: g.member, body: { guideLoose: false } });
+    assert.equal(tight.data.song.guide.loose, undefined);
+    assert.equal(tight.data.song.guide.start, 4.568);
+    assert.ok(tight.data.version > moved.data.version);
+    await call('DELETE', `/api/rooms/${g.code}`, { member: g.member });
+    // 가이드가 없는 방에서는 고칠 것이 없다
+    assert.equal((await call('PUT', `/api/rooms/${code}/settings`, { member: host, body: { guideStart: 1 } })).status, 409);
+    // 유튜브 영상을 반주로 쓰는 방에는 가이드를 따로 두지 않는다
+    const both = await call('POST', '/api/rooms', { body: { title: 'x', hostName: 'h', song: { dur: 60, yt: { id: 'ttbDEMO0001' }, guide: { id: 'ttbMV000001' } } } });
+    assert.equal(both.data.room.song.guide, undefined);
+    assert.equal(both.data.room.song.yt.id, 'ttbDEMO0001');
   });
 
   if (!EXTERNAL) {

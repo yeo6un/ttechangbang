@@ -1,14 +1,15 @@
 // 방 화면: 타임라인, 내 파트, 함께 부르는 사람, 가사. 여기서 녹음하러 가거나 완성본을 들으러 간다.
 import { useEffect, useMemo, useState } from 'react';
 import { Timeline } from '../components/Timeline';
-import { api, ApiError, type Room } from '../lib/api';
+import { api, ApiError, type GuideRef, type Room } from '../lib/api';
 import { fmtSpan, fmtTime, isAll, roomProgress, seatColor, seatName, type Line } from '../lib/parts';
 import { fmtCode, navigate, roomLink } from '../lib/router';
 import { useRoom } from '../lib/room';
 import { useRoomAudio } from '../lib/roomAudio';
 import { daysLeft, seatInfos, seatNames, type SeatInfo } from '../lib/roomView';
 import { store } from '../lib/store';
-import { YtFrame, YtTapNote } from '../lib/yt/useYt';
+import { YT } from '../lib/yt/player';
+import { useYtPlayer, YtFrame, YtTapNote } from '../lib/yt/useYt';
 import { copyText, Icon, InAppNotice, SeatDot, Sheet, Spinner, TopBar, useRaf, useToast } from '../ui';
 
 export function RoomScreen({ code }: { code: string }) {
@@ -189,6 +190,9 @@ export function RoomScreen({ code }: { code: string }) {
             />
           </section>
 
+          {/* MR로 부르는 방에 붙여 둔 원곡 영상: 녹음하기 전에 들어 볼 수 있다 */}
+          {room.song.guide && !room.song.yt && <GuideViewer guide={room.song.guide} onPlay={audio.pause} />}
+
           {mySeat !== null &&
             (mine && !picking ? (
               <MyPart info={mine} room={room} onChange={() => setPicking(true)} />
@@ -329,6 +333,31 @@ export function RoomScreen({ code }: { code: string }) {
         />
       )}
     </main>
+  );
+}
+
+/** 가이드 영상(원곡)을 펼쳐서 볼 수 있는 칸. 펼쳤을 때만 영상을 불러온다. */
+function GuideViewer({ guide, onPlay }: { guide: GuideRef; onPlay: () => void }) {
+  const [open, setOpen] = useState(false);
+  const yt = useYtPlayer(open ? guide.id : null, true);
+  const player = yt.player;
+  // 영상을 틀면 방의 반주는 멈춘다 (두 소리가 겹치지 않게)
+  useEffect(() => {
+    if (!player) return;
+    return player.on((e) => {
+      if (e.type === 'state' && e.state === YT.PLAYING) onPlay();
+    });
+  }, [player, onPlay]);
+  return (
+    <details className="card options guide-view" onToggle={(e) => setOpen((e.currentTarget as HTMLDetailsElement).open)}>
+      <summary>원곡 영상 보기 (가이드)</summary>
+      {open && <YtFrame yt={yt} />}
+      <p className="hint">
+        {guide.title || '원곡 영상'}
+        {guide.author ? ` · ${guide.author}` : ''}
+        {guide.loose ? '. 부르기 전에 들어 보는 용도예요.' : '. 녹음할 때 이 영상을 보고 들으면서 따라 부를 수 있어요.'}
+      </p>
+    </details>
   );
 }
 

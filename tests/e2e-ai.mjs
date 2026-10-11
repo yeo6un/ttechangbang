@@ -42,10 +42,13 @@ try {
       return btoa(s);
     });
     await page.locator('#song-file').setInputFiles({ name: 'ai-test.wav', mimeType: 'audio/wav', buffer: Buffer.from(wavB64, 'base64') });
+    // 파일만 고르고(원곡 영상 없이) 넘어간다
+    await page.getByRole('heading', { name: '반주와 원곡 영상을 골라요' }).waitFor({ timeout: 20000 });
+    await page.getByRole('button', { name: '다음: 부를 구간 고르기' }).click();
     await page.getByRole('button', { name: '전체' }).click();
     await page.getByRole('button', { name: '이 구간으로 할게요' }).click();
     await page.getByRole('heading', { name: '가사를 넣어 주세요' }).waitFor();
-    await page.getByText('노래가 방에 올라갔어요').waitFor({ timeout: 30000 });
+    await page.getByText('반주가 방에 올라갔어요').waitFor({ timeout: 30000 });
   };
   const readStarts = async () =>
     (await page.locator('.timing-list li .timing-text small').allInnerTexts()).map((t) => {
