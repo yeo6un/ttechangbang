@@ -1,15 +1,13 @@
-// 곡·가사·유튜브 영상 찾기. 열쇠 없이 쓰는 공개 API 를 서버가 대신 불러 준다.
-//  - 곡 목록: Apple iTunes Search API
-//  - 가사: LRCLIB (공개 가사 데이터베이스. 줄별 시간표가 들어 있는 곡이 많다)
-//  - 유튜브 영상: YOUTUBE_API_KEY 가 있으면 YouTube Data API, 없으면 Odesli(song.link) 의 곡 링크 변환
+// 곡·가사·유튜브 영상 찾기. 공개 서비스를 서버가 대신 불러 준다.
+//  - 가사와 곡 목록: LRCLIB (공개 가사 데이터베이스. 줄별 시간표가 들어 있는 곡이 많다)
+//  - 유튜브 영상 찾기: YOUTUBE_API_KEY 가 있을 때만, 공식 YouTube Data API 로
 //  - 영상 제목 확인: YouTube oEmbed
 // 음원은 내려받지 않는다. 영상은 유튜브 플레이어로 그대로 재생한다.
+// (Apple 의 곡 검색은 Cloudflare 서버에서 부르면 막혀서, 화면 쪽에서 직접 부른다 — web/src/lib/find.ts)
 // env.fetch 가 있으면 그것을 쓴다 (테스트에서 가짜 응답을 넣기 위한 자리).
 
 const UA = 'ttechangbang/0.2 (https://github.com/yeo6un/ttechangbang)';
 const LRCLIB = 'https://lrclib.net/api';
-const ITUNES = 'https://itunes.apple.com';
-const ODESLI = 'https://api.song.link/v1-alpha.1/links';
 const YT_API = 'https://www.googleapis.com/youtube/v3';
 
 const enc = encodeURIComponent;
@@ -99,41 +97,6 @@ export function parseYtId(input) {
 
 // ───────────── 곡 목록 ─────────────
 
-async function itunesSearch(env, q, limit = 12) {
-  const r = await getJson(env, `${ITUNES}/search?term=${enc(q)}&country=KR&media=music&entity=song&limit=${limit}`);
-  const songs = [];
-  const seen = new Set();
-  for (const x of r.data?.results || []) {
-    if (x?.kind !== 'song' || !x.trackId || !x.trackName || !x.artistName) continue;
-    const dur = Math.round((Number(x.trackTimeMillis) || 0) / 1000);
-    // 같은 곡이 싱글·앨범·모음집으로 여러 번 나온다
-    const key = `${norm(x.trackName)}|${norm(x.artistName)}|${Math.round(dur / 4)}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    songs.push({
-      id: 'it' + x.trackId,
-      itunesId: x.trackId,
-      title: String(x.trackName).slice(0, 120),
-      artist: String(x.artistName).slice(0, 80),
-      album: String(x.collectionName || '').slice(0, 120),
-      dur,
-      art: typeof x.artworkUrl100 === 'string' ? x.artworkUrl100.replace('100x100bb', '200x200bb') : '',
-    });
-  }
-  return { status: r.status, songs };
-}
-
-/** 영어 이름 등 다른 표기를 알아본다 (가사 데이터베이스에는 영어 표기로 올라온 곡이 많다) */
-async function itunesAltNames(env, itunesId) {
-  const out = [];
-  for (const query of [`country=KR&lang=en_us`, `country=US`]) {
-    const r = await getJson(env, `${ITUNES}/lookup?id=${enc(itunesId)}&${query}`, 5000);
-    const x = (r.data?.results || []).find((y) => y?.trackName && y?.artistName);
-    if (x) out.push({ title: String(x.trackName), artist: String(x.artistName) });
-  }
-  return out;
-}
-
 const lrc = (r) => ({
   id: Number(r?.id) || 0,
   title: String(r?.trackName || r?.name || ''),
@@ -169,18 +132,27 @@ async function lrclibSongs(env, q) {
   return { status: r.status, songs };
 }
 
-export async function findSongs(env, q) {
-  const [it, lr] = await Promise.all([itunesSearch(env, q), lrclibSongs(env, q)]);
-  if (it.songs.length) {
-    // 가사가 있는지 미리 귀띔해 준다 (같은 검색어로 가사 쪽에서도 찾힌 곡만)
-    for (const s of it.songs) {
-      const hit = lr.songs.find((l) => sameText(l.title, s.title) === 2 && (sameArtist(l.artist, s.artist) || Math.abs(l.dur - s.dur) <= 3));
-      if (hit) s.lyrics = hit.lyrics;
+/**
+ * 곡 목록 찾기. 한글로 적은 검색어는 가사 데이터베이스의 영어 표기와 안 맞는 일이 많아서,
+ * 결과가 없고 AI 가 연결돼 있으면 공식 표기로 바꾼 검색어로 한 번 더 찾는다.
+ */
+export async function findSongs(env, q, { rewrite } = {}) {
+  const first = await lrclibSongs(env, q);
+  if (first.songs.length) return { songs: first.songs, via: 'lrclib' };
+  if (rewrite) {
+    let alts = [];
+    try {
+      alts = await rewrite(q);
+    } catch {
+      alts = [];
     }
-    return { songs: it.songs, via: 'itunes' };
+    for (const alt of alts.slice(0, 3)) {
+      if (norm(alt) === norm(q)) continue;
+      const r = await lrclibSongs(env, alt);
+      if (r.songs.length) return { songs: r.songs, via: 'lrclib', rewritten: alt };
+    }
   }
-  if (lr.songs.length) return { songs: lr.songs, via: 'lrclib' };
-  return { songs: [], via: 'none', down: it.status !== 200 && lr.status !== 200, upstream: { itunes: it.status, lrclib: lr.status } };
+  return { songs: [], via: 'none', down: first.status !== 200 };
 }
 
 // ───────────── 가사 ─────────────
@@ -229,9 +201,14 @@ export async function findLyrics(env, want) {
     const x = r.data ? lrc(r.data) : null;
     if (x && (x.plain || x.synced)) return result(x);
   }
-  if (!want.title) return { found: false };
+  // 같은 곡의 여러 표기(한글 이름, 영어 이름)를 차례로 찾아본다
+  const names = [];
+  for (const n of want.names || []) {
+    if (!n?.title) continue;
+    if (!names.some((m) => norm(m.title) === norm(n.title) && norm(m.artist) === norm(n.artist))) names.push({ title: n.title, artist: n.artist || '' });
+  }
+  if (!names.length) return { found: false };
 
-  const names = [{ title: want.title, artist: want.artist || '' }];
   const best = () => {
     let top = null;
     let topScore = 0;
@@ -244,31 +221,22 @@ export async function findLyrics(env, want) {
     }
     return top;
   };
-  const round = async ({ title, artist }) => {
+  let reached = false;
+  for (const { title, artist } of names.slice(0, 3)) {
     const short = stripTitle(title);
     const queries = new Set();
     if (artist) queries.add(`track_name=${enc(short)}&artist_name=${enc(artist)}`);
     queries.add(`track_name=${enc(short)}`);
     if (artist) queries.add(`q=${enc(`${short} ${artist}`)}`);
     const res = await Promise.all([...queries].map((q) => getJson(env, `${LRCLIB}/search?${q}`)));
-    for (const r of res) add(r.data);
-    return res.some((r) => r.status === 200);
-  };
-
-  let reached = await round(names[0]);
-  let top = best();
-  if (top?.synced) return result(top);
-  // 다른 표기(영어 이름 등)로 한 번 더
-  if (want.itunesId) {
-    for (const alt of await itunesAltNames(env, want.itunesId)) {
-      if (names.some((n) => norm(n.title) === norm(alt.title) && norm(n.artist) === norm(alt.artist))) continue;
-      names.push(alt);
-      reached = (await round(alt)) || reached;
-      top = best();
-      if (top?.synced) return result(top);
+    for (const r of res) {
+      add(r.data);
+      if (r.status === 200) reached = true;
     }
+    const top = best();
+    if (top?.synced) return result(top);
   }
-  top = best();
+  const top = best();
   return top ? result(top) : { found: false, down: !reached };
 }
 
@@ -321,39 +289,10 @@ async function ytApiSearch(env, want) {
     .map(({ score, ...v }) => v);
 }
 
-async function odesliYoutube(env, itunesId) {
-  const r = await getJson(env, `${ODESLI}?platform=itunes&type=song&id=${enc(itunesId)}&userCountry=KR&songIfSingle=true`, 8000);
-  const links = r.data?.linksByPlatform || {};
-  for (const k of ['youtube', 'youtubeMusic']) {
-    const link = links[k];
-    const id = /^YOUTUBE_VIDEO::([A-Za-z0-9_-]{11})$/.exec(link?.entityUniqueId || '')?.[1] || parseYtId(link?.url || '');
-    if (id) return { status: r.status, id };
-  }
-  return { status: r.status, id: '' };
-}
-
+/** 가수·곡 이름으로 유튜브 영상을 찾는다. YouTube Data API 열쇠가 있을 때만 된다. */
 export async function findVideo(env, want) {
-  const upstream = {};
-  if (env.YOUTUBE_API_KEY && (want.title || want.artist)) {
-    const list = await ytApiSearch(env, want);
-    if (list.length) return { found: true, ...list[0], alts: list.slice(1, 5), via: 'youtube' };
-    upstream.youtube = 'empty';
-  }
-  let itunesId = want.itunesId;
-  if (!itunesId && want.title) {
-    const s = await itunesSearch(env, `${want.artist || ''} ${want.title}`.trim(), 6);
-    upstream.itunes = s.status;
-    const hit = s.songs.find((x) => sameText(x.title, want.title) && (!want.artist || sameArtist(x.artist, want.artist) || Math.abs(x.dur - (want.dur || 0)) <= 3));
-    if (hit) itunesId = hit.itunesId;
-  }
-  if (itunesId) {
-    const o = await odesliYoutube(env, itunesId);
-    upstream.odesli = o.status;
-    if (o.id) {
-      const info = await ytInfo(env, o.id);
-      if (info.ok) return { found: true, id: o.id, title: info.title, author: info.author, thumb: info.thumb, len: 0, alts: [], via: 'odesli' };
-      upstream.oembed = info.reason;
-    }
-  }
-  return { found: false, upstream };
+  if (!env.YOUTUBE_API_KEY) return { found: false, reason: 'no_key' };
+  const list = await ytApiSearch(env, want);
+  if (!list.length) return { found: false, reason: 'empty' };
+  return { found: true, ...list[0], alts: list.slice(1, 5), via: 'youtube' };
 }

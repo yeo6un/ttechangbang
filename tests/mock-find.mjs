@@ -1,7 +1,6 @@
-// 가짜 검색 서버: 바깥 서비스(iTunes, LRCLIB, Odesli, YouTube) 대신 정해 둔 응답을 돌려준다. 테스트 전용.
+// 가짜 검색 서버: 바깥 서비스(LRCLIB, YouTube) 대신 정해 둔 응답을 돌려준다. 테스트 전용.
 // 노래는 앱에 들어 있는 연습용 비트(가사도 이 앱을 위해 새로 지은 것)를 "발매된 곡"처럼 꾸민 것이다.
-//  - 한글 이름으로는 가사가 안 나오고 영어 이름으로만 나온다 → 다른 표기로 다시 찾는 길을 확인
-//  - 검색어에 itunesdown 이 들어가면 곡 검색 서버가 죽은 것처럼 군다 → 가사 서버 목록으로 대신하는 길을 확인
+// 가사 데이터베이스에는 영어 이름으로만 올라와 있다 → 한글 검색어·한글 곡 이름으로는 바로 안 나온다.
 const BAR = (4 * 60) / 92;
 export const DEMO_TEXTS = ['하나 둘 셋 시작해', '목소리를 겹쳐 봐', '틀려도 그냥 웃어', '박자는 대충 가도', '여기는 내가 할게', '다음은 네가 받아', '다 같이 크게 질러 봐', '떼창방에서 만나'];
 export const DEMO_VIDEO = 'ttbDEMO0001';
@@ -12,21 +11,6 @@ const stamp = (t) => `[${String(Math.floor(t / 60)).padStart(2, '0')}:${(t % 60)
 const SYNCED = DEMO_TEXTS.map((text, i) => `${stamp((1 + i) * BAR)} ${text}`).join('\n');
 const PLAIN = DEMO_TEXTS.join('\n');
 
-const SONGS = [
-  { trackId: 1001, ko: ['연습용 노래', '떼창방 밴드'], en: ['Practice Song', 'Ttechang Band'], album: '떼창방 1집', ms: 24080 },
-  { trackId: 1002, ko: ['가사 없는 노래', '떼창방 밴드'], en: ['Song Without Words', 'Ttechang Band'], album: '떼창방 1집', ms: 200000 },
-  { trackId: 1003, ko: ['타이밍 없는 노래', '떼창방 밴드'], en: ['Untimed Song', 'Ttechang Band'], album: '떼창방 2집', ms: 24080 },
-];
-const itunesRow = (s, lang) => ({
-  wrapperType: 'track',
-  kind: 'song',
-  trackId: s.trackId,
-  trackName: s[lang][0],
-  artistName: s[lang][1],
-  collectionName: s.album,
-  trackTimeMillis: s.ms,
-  artworkUrl100: `https://is1-ssl.mzstatic.com/image/thumb/Music/test/${s.trackId}/100x100bb.jpg`,
-});
 const LRC = [
   { id: 501, trackName: 'Practice Song', artistName: 'Ttechang Band', albumName: 'Ttechang Vol.1', duration: 24.0, instrumental: false, plainLyrics: PLAIN, syncedLyrics: SYNCED },
   { id: 502, trackName: 'Practice Song', artistName: 'Ttechang Band', albumName: 'Ttechang Live', duration: 61.0, instrumental: false, plainLyrics: PLAIN, syncedLyrics: null },
@@ -44,20 +28,6 @@ export default async function mockFetch(input) {
   const p = url.searchParams;
   calls.push(url.host + url.pathname + url.search);
 
-  if (url.host === 'itunes.apple.com') {
-    if (url.pathname === '/search') {
-      const term = p.get('term') || '';
-      if (has(term, 'itunesdown')) return json({}, 503);
-      const hits = SONGS.filter((s) => [...s.ko, ...s.en].some((n) => has(term, n) || has(n, term)) || (has(term, '떼창방') || has(term, '연습')) && s.trackId !== 1002);
-      return json({ resultCount: hits.length, results: hits.map((s) => itunesRow(s, 'ko')) });
-    }
-    if (url.pathname === '/lookup') {
-      const s = SONGS.find((x) => String(x.trackId) === p.get('id'));
-      const lang = p.get('lang') === 'en_us' || p.get('country') === 'US' ? 'en' : 'ko';
-      return json({ resultCount: s ? 1 : 0, results: s ? [itunesRow(s, lang)] : [] });
-    }
-  }
-
   if (url.host === 'lrclib.net') {
     const m = /^\/api\/get\/(\d+)$/.exec(url.pathname);
     if (m) {
@@ -69,25 +39,11 @@ export default async function mockFetch(input) {
       const track = p.get('track_name');
       const artist = p.get('artist_name');
       const hits = LRC.filter((r) => {
-        if (q) return q.toLowerCase().replace('itunesdown', '').trim().split(/\s+/).every((w) => has(r.trackName + ' ' + r.artistName, w));
+        if (q) return q.toLowerCase().trim().split(/\s+/).every((w) => has(r.trackName + ' ' + r.artistName, w));
         return (!track || has(r.trackName, track)) && (!artist || has(r.artistName, artist));
       });
       return json(hits);
     }
-  }
-
-  if (url.host === 'api.song.link') {
-    const id = p.get('id');
-    if (id === '1001' || id === '1003') {
-      return json({
-        entityUniqueId: `ITUNES_SONG::${id}`,
-        linksByPlatform: {
-          youtube: { country: 'KR', url: `https://www.youtube.com/watch?v=${DEMO_VIDEO}`, entityUniqueId: `YOUTUBE_VIDEO::${DEMO_VIDEO}` },
-          youtubeMusic: { country: 'KR', url: `https://music.youtube.com/watch?v=${DEMO_VIDEO}`, entityUniqueId: `YOUTUBE_VIDEO::${DEMO_VIDEO}` },
-        },
-      });
-    }
-    return json({ statusCode: 404, code: 'could_not_resolve_entity' }, 404);
   }
 
   if (url.host === 'www.youtube.com' && url.pathname === '/oembed') {

@@ -107,3 +107,30 @@ export async function aiSplit(env, { title, lines, seatCount, notes }) {
   if (Object.keys(assign).length < Math.ceil(lines.length * 0.5)) throw new Error('model covered too few lines');
   return { assign, summary: String(data.summary || '').slice(0, 300), source: 'ai' };
 }
+
+const QUERY_SYSTEM = `You help a music search box. The user typed an artist and/or song title, often in Korean (Hangul), sometimes misspelled or transliterated.
+Give up to 3 search strings that use the official spellings found on streaming services: the artist's official name (usually Latin script for K-pop groups) and the official track title.
+Examples: "트와이스 하트셰이커" -> ["TWICE Heart Shaker"], "아이유 밤편지" -> ["IU 밤편지", "IU Through the Night"].
+If you do not recognise the song, just transliterate sensibly. Answer with JSON only: {"queries":["..."]}`;
+
+/** 한글로 적은 검색어를 공식 표기로 바꾼 후보들을 받는다 (가사 데이터베이스는 영어 표기로 올라온 곡이 많다) */
+export async function aiSongQueries(env, q) {
+  const out = await env.AI.run(env.AI_TEXT_MODEL || DEFAULT_TEXT, {
+    messages: [
+      { role: 'system', content: QUERY_SYSTEM },
+      { role: 'user', content: String(q).slice(0, 80) },
+    ],
+    response_format: { type: 'json_schema', json_schema: { type: 'object', properties: { queries: { type: 'array', items: { type: 'string' } } }, required: ['queries'] } },
+    max_tokens: 120,
+    temperature: 0.1,
+  });
+  let data = out?.response ?? out?.result?.response ?? out;
+  if (typeof data === 'string') {
+    const a = data.indexOf('{');
+    const b = data.lastIndexOf('}');
+    if (a < 0 || b <= a) return [];
+    data = JSON.parse(data.slice(a, b + 1));
+  }
+  if (!data || !Array.isArray(data.queries)) return [];
+  return data.queries.map((x) => String(x || '').replace(/\s+/g, ' ').trim().slice(0, 80)).filter((x) => x.length >= 2).slice(0, 3);
+}

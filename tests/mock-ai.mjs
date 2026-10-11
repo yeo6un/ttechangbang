@@ -22,6 +22,10 @@ export default {
       return { text: segments.map((s) => s.text).join(''), word_count: 30, transcription_info: { language: 'ko', duration: 24 }, segments };
     }
     const user = input.messages[input.messages.length - 1].content;
+    // 검색어 다듬기: 한글로 적은 연습용 노래를 가사 데이터베이스의 영어 표기로 바꿔 준다
+    if (/music search box/.test(input.messages[0].content)) {
+      return { response: { queries: /연습|떼창방/.test(user) ? ['Ttechang Band Practice Song'] : [] } };
+    }
     const n = Number(/Singers: (\d+)/.exec(user)?.[1] || 2);
     const count = user.split('\n').filter((l) => /^\d+ \| /.test(l)).length;
     const lines = Array.from({ length: count }, (_, i) => ({ i, s: i === count - 1 ? Array.from({ length: n }, (_, k) => k + 1) : [(i % n) + 1] }));

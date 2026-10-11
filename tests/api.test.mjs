@@ -275,56 +275,46 @@ try {
   });
 
   if (!EXTERNAL) {
-    await step('곡 찾기: 가수·곡 이름으로 목록이 나온다', async () => {
+    await step('곡 찾기: 가사 데이터베이스에서 목록이 나오고, 같은 곡은 시간표 있는 쪽 하나만 남는다', async () => {
       assert.equal((await call('GET', '/api/find/songs?q=a')).status, 400);
-      const r = await call('GET', `/api/find/songs?q=${encodeURIComponent('떼창방 밴드 연습용 노래')}`);
+      const r = await call('GET', '/api/find/songs?q=practice%20song');
       assert.equal(r.status, 200);
-      assert.equal(r.data.via, 'itunes');
-      const s = r.data.songs[0];
-      assert.equal(s.title, '연습용 노래');
-      assert.equal(s.artist, '떼창방 밴드');
-      assert.equal(s.itunesId, 1001);
-      assert.equal(s.dur, 24);
-      assert.match(s.art, /200x200bb/);
-      assert.equal((await call('GET', `/api/find/songs?q=${encodeURIComponent('세상에없는노래zzz')}`)).data.songs.length, 0);
-    });
-
-    await step('곡 찾기: 곡 검색 서버가 죽어도 가사 서버 목록으로 대신한다', async () => {
-      const r = await call('GET', '/api/find/songs?q=itunesdown%20practice');
       assert.equal(r.data.via, 'lrclib');
-      const s = r.data.songs.find((x) => x.artist === 'Ttechang Band' && x.title === 'Practice Song');
-      assert.equal(s.lyrics, 'synced');
-      assert.equal(s.lrclibId, 501);
-      const l = await call('GET', `/api/find/lyrics?lrclib=${s.lrclibId}`);
+      const mine = r.data.songs.filter((x) => x.artist === 'Ttechang Band');
+      assert.equal(mine.length, 1);
+      assert.deepEqual({ ...mine[0] }, { id: 'lr501', lrclibId: 501, title: 'Practice Song', artist: 'Ttechang Band', album: 'Ttechang Vol.1', dur: 24, art: '', lyrics: 'synced' });
+      // 한글 검색어는 영어 표기와 안 맞아 바로는 안 나온다 (AI 가 없는 서버)
+      const ko = await call('GET', `/api/find/songs?ai=1&q=${encodeURIComponent('떼창방 밴드 연습용 노래')}`);
+      assert.equal(ko.data.songs.length, 0);
+      assert.equal(ko.data.down, false);
+      const l = await call('GET', '/api/find/lyrics?lrclib=501');
       assert.equal(l.data.found, true);
       assert.match(l.data.synced, /^\[00:02\.61\]/);
     });
 
-    await step('가사 찾기: 한글 이름으로 없으면 영어 표기로 다시 찾고, 제목만 같은 남의 곡은 고르지 않는다', async () => {
-      const q = `title=${encodeURIComponent('연습용 노래')}&artist=${encodeURIComponent('떼창방 밴드')}&dur=24&itunes=1001`;
-      const r = await call('GET', `/api/find/lyrics?${q}`);
+    await step('가사 찾기: 다른 표기(영어 이름)까지 넣어 주면 찾고, 제목만 같은 남의 곡은 고르지 않는다', async () => {
+      const ko = `title=${encodeURIComponent('연습용 노래')}&artist=${encodeURIComponent('떼창방 밴드')}&dur=24`;
+      assert.equal((await call('GET', `/api/find/lyrics?${ko}`)).data.found, false);
+      const r = await call('GET', `/api/find/lyrics?${ko}&title2=${encodeURIComponent('Practice Song (Remastered)')}&artist2=${encodeURIComponent('Ttechang Band')}`);
       assert.equal(r.status, 200);
       assert.equal(r.data.found, true);
-      assert.equal(r.data.id, 501);
+      assert.equal(r.data.id, 501); // 길이가 맞고 시간표가 있는 쪽
       assert.equal(r.data.source, 'LRCLIB');
       assert.equal(r.data.synced.split('\n').length, 8);
       // 시간표 없는 가사만 있는 곡
-      const u = await call('GET', `/api/find/lyrics?title=${encodeURIComponent('타이밍 없는 노래')}&artist=${encodeURIComponent('떼창방 밴드')}&dur=24&itunes=1003`);
+      const u = await call('GET', '/api/find/lyrics?title=Untimed%20Song&artist=Ttechang%20Band&dur=24');
       assert.equal(u.data.found, true);
       assert.equal(u.data.synced, '');
       assert.equal(u.data.plain.split('\n').length, 8);
-      // 가사가 없는 곡
-      const none = await call('GET', `/api/find/lyrics?title=${encodeURIComponent('가사 없는 노래')}&artist=${encodeURIComponent('떼창방 밴드')}&dur=200&itunes=1002`);
-      assert.equal(none.data.found, false);
+      // 가수 이름도 길이도 안 맞으면 같은 제목이라도 버린다
+      assert.equal((await call('GET', '/api/find/lyrics?title=Practice%20Song&artist=Nobody&dur=120')).data.found, false);
+      assert.equal((await call('GET', '/api/find/lyrics?title=No%20Such%20Song&artist=Ttechang%20Band')).data.found, false);
     });
 
-    await step('영상 찾기와 링크 확인', async () => {
-      const v = await call('GET', `/api/find/video?title=${encodeURIComponent('연습용 노래')}&artist=${encodeURIComponent('떼창방 밴드')}&itunes=1001&dur=24`);
-      assert.equal(v.data.found, true);
-      assert.equal(v.data.id, 'ttbDEMO0001');
-      assert.equal(v.data.via, 'odesli');
-      assert.match(v.data.title, /연습용 노래/);
-      assert.equal((await call('GET', `/api/find/video?title=${encodeURIComponent('가사 없는 노래')}&itunes=1002`)).data.found, false);
+    await step('영상 링크 확인. 열쇠가 없으면 영상 자동 찾기는 꺼져 있다', async () => {
+      assert.equal((await call('GET', '/api/config')).data.ytSearch, false);
+      const v = await call('GET', '/api/find/video?title=Practice%20Song&artist=Ttechang%20Band&dur=24');
+      assert.deepEqual(v.data, { found: false, reason: 'no_key' });
       const ok = await call('GET', `/api/find/yt?url=${encodeURIComponent('https://m.youtube.com/watch?v=ttbMV000001&feature=share')}`);
       assert.equal(ok.data.ok, true);
       assert.equal(ok.data.id, 'ttbMV000001');
@@ -341,11 +331,42 @@ try {
       const db = new DatabaseSync(path.join(dataDir, 'ttechang.db'));
       const keys = db.prepare('SELECT key FROM cache').all().map((r) => r.key);
       db.close();
-      assert.ok(keys.some((k) => k.startsWith('songs:')));
+      assert.ok(keys.includes('songs:raw:practice song'));
       assert.ok(keys.some((k) => k.startsWith('lyrics:')));
-      assert.ok(keys.some((k) => k.startsWith('video:')));
       assert.ok(keys.includes('yt:ttbMV000001'));
       assert.ok(!keys.includes('yt:blockedAAAA')); // 실패한 결과는 저장하지 않는다
+    });
+
+    await step('AI·유튜브 열쇠가 연결된 서버: 한글 검색어를 공식 표기로 바꿔 찾고, 영상도 자동으로 고른다', async () => {
+      const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'ttb-api2-'));
+      const s2 = spawn(process.execPath, [path.join(root, 'server/node-server.mjs')], {
+        env: { ...process.env, PORT: '8898', DATA_DIR: dir2, MOCK_FIND: '1', MOCK_AI: '1', YOUTUBE_API_KEY: 'test-key' },
+        stdio: ['ignore', 'pipe', 'inherit'],
+      });
+      try {
+        await new Promise((resolve, reject) => {
+          s2.stdout.on('data', (d) => String(d).includes('http://') && resolve());
+          setTimeout(() => reject(new Error('second server start timeout')), 8000);
+        });
+        const get = async (u) => (await fetch('http://127.0.0.1:8898' + u)).json();
+        const cfg = await get('/api/config');
+        assert.equal(cfg.ai, true);
+        assert.equal(cfg.ytSearch, true);
+        const q = encodeURIComponent('떼창방 밴드 연습용 노래');
+        assert.equal((await get(`/api/find/songs?q=${q}`)).songs.length, 0); // 부탁하지 않으면 AI 를 쓰지 않는다
+        const r = await get(`/api/find/songs?ai=1&q=${q}`);
+        assert.equal(r.rewritten, 'Ttechang Band Practice Song');
+        assert.equal(r.songs[0].lrclibId, 501);
+        // 라이브·뮤직비디오보다 길이가 맞는 음원 영상을 먼저 고른다
+        const v = await get('/api/find/video?title=Practice%20Song&artist=Ttechang%20Band&dur=24');
+        assert.equal(v.found, true);
+        assert.equal(v.id, 'ttbDEMO0001');
+        assert.equal(v.len, 24);
+        assert.deepEqual(v.alts.map((a) => a.id), ['ttbMV000001', 'liveLIVE001']);
+      } finally {
+        s2.kill();
+        fs.rmSync(dir2, { recursive: true, force: true });
+      }
     });
   }
 

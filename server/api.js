@@ -2,7 +2,7 @@
 // Cloudflare Worker(D1)와 Node(node:sqlite) 양쪽에서 같은 코드가 돈다.
 // env.DB 는 { run, all, get, batch } 를 가진 얇은 어댑터다 (db-d1.js / node-server.mjs 참고).
 
-import { aiAlign, aiSplit } from './ai.js';
+import { aiAlign, aiSongQueries, aiSplit } from './ai.js';
 import { findLyrics, findSongs, findVideo, parseYtId, ytInfo } from './find.js';
 
 const DAY = 86_400_000;
@@ -417,7 +417,7 @@ async function route(request, env, ctx) {
   const ip = clientIp(request);
 
   if (seg[0] === 'config' && method === 'GET') {
-    return json({ ai: !!env.AI, find: true, limits: { songSeconds: LIMITS.songSeconds, ytSeconds: LIMITS.ytSeconds, seats: LIMITS.seats, roomDays: LIMITS.roomTtl / DAY }, now: Date.now() });
+    return json({ ai: !!env.AI, find: true, ytSearch: !!env.YOUTUBE_API_KEY, limits: { songSeconds: LIMITS.songSeconds, ytSeconds: LIMITS.ytSeconds, seats: LIMITS.seats, roomDays: LIMITS.roomTtl / DAY }, now: Date.now() });
   }
 
   // 곡·가사·유튜브 영상 찾기 (방과 상관없이 쓸 수 있다)
@@ -432,21 +432,28 @@ async function route(request, env, ctx) {
     if (seg[1] === 'songs') {
       const q = text('q', 80);
       if (q.length < 2) fail(400, 'short_query', '가수나 곡 이름을 두 글자 이상 넣어 주세요.');
-      return json(await cached(db, 'songs:' + q.toLowerCase(), DAY, () => findSongs(env, q), (v) => v.songs.length > 0));
+      // ai=1: 그대로 찾아서 없으면 AI 가 공식 표기로 바꾼 검색어로 한 번 더 (AI 횟수를 아끼려고 따로 부탁할 때만)
+      const useAi = p.get('ai') === '1' && !!env.AI && rateLimit('findai:' + ip, 20, HOUR);
+      const rewrite = useAi ? (query) => aiSongQueries(env, query) : undefined;
+      return json(await cached(db, `songs:${useAi ? 'ai' : 'raw'}:${q.toLowerCase()}`, DAY, () => findSongs(env, q, { rewrite }), (v) => v.songs.length > 0));
     }
     if (seg[1] === 'lyrics') {
-      const want = { title: text('title', 120), artist: text('artist', 80), dur: num(p.get('dur'), 0, 3600, 0), lrclibId: intOf('lrclib'), itunesId: intOf('itunes') };
-      if (!want.title && !want.lrclibId) fail(400, 'no_title', '곡 이름이 필요해요.');
-      const key = `lyrics:${want.lrclibId}:${want.itunesId}:${want.title.toLowerCase()}|${want.artist.toLowerCase()}|${Math.round(want.dur)}`;
-      // 못 찾은 결과는 잠깐만 기억한다 (가사가 나중에 올라올 수 있다)
-      const hit = await cached(db, key, 7 * DAY, () => findLyrics(env, want), (v) => v.found);
-      return json(hit);
+      // 같은 곡의 표기를 두 가지까지 받는다 (title/artist, title2/artist2)
+      const names = [
+        { title: text('title', 120), artist: text('artist', 80) },
+        { title: text('title2', 120), artist: text('artist2', 80) },
+      ].filter((n) => n.title);
+      const want = { names, dur: num(p.get('dur'), 0, 3600, 0), lrclibId: intOf('lrclib') };
+      if (!names.length && !want.lrclibId) fail(400, 'no_title', '곡 이름이 필요해요.');
+      const key = `lyrics:${want.lrclibId}:${names.map((n) => `${n.title}|${n.artist}`).join('||').toLowerCase()}:${Math.round(want.dur)}`;
+      // 못 찾은 결과는 저장하지 않는다 (가사가 나중에 올라올 수 있다)
+      return json(await cached(db, key, 7 * DAY, () => findLyrics(env, want), (v) => v.found));
     }
     if (seg[1] === 'video') {
-      const want = { title: text('title', 120), artist: text('artist', 80), dur: num(p.get('dur'), 0, 3600, 0), itunesId: intOf('itunes') };
-      if (!want.title && !want.itunesId) fail(400, 'no_title', '곡 이름이 필요해요.');
-      const key = `video:${env.YOUTUBE_API_KEY ? 'k' : 'o'}:${want.itunesId}:${want.title.toLowerCase()}|${want.artist.toLowerCase()}`;
-      return json(await cached(db, key, 7 * DAY, () => findVideo(env, want), (v) => v.found));
+      const want = { title: text('title', 120), artist: text('artist', 80), dur: num(p.get('dur'), 0, 3600, 0) };
+      if (!want.title) fail(400, 'no_title', '곡 이름이 필요해요.');
+      if (!env.YOUTUBE_API_KEY) return json({ found: false, reason: 'no_key' });
+      return json(await cached(db, `video:${want.title.toLowerCase()}|${want.artist.toLowerCase()}|${Math.round(want.dur)}`, 7 * DAY, () => findVideo(env, want), (v) => v.found));
     }
     if (seg[1] === 'yt') {
       const id = parseYtId(p.get('url') || '');
