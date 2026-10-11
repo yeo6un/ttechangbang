@@ -13,7 +13,7 @@
     "test:api": "node tests/api.test.mjs",
     "test:e2e": "node tests/e2e.mjs && node tests/e2e-create.mjs && node tests/e2e-ai.mjs",
     "cf:dev": "wrangler dev -c wrangler.local.jsonc",
-    "deploy": "npm run build && wrangler deploy"
+    "deploy": "wrangler deploy"
   },
   "engines": {
     "node": ">=22.13"
