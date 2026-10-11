@@ -110,6 +110,7 @@ export async function aiSplit(env, { title, lines, seatCount, notes }) {
 
 const QUERY_SYSTEM = `You help a music search box. The user typed an artist and/or song title, often in Korean (Hangul), sometimes misspelled or transliterated.
 Give up to 3 search strings that use the official spellings found on streaming services: the artist's official name (usually Latin script for K-pop groups) and the official track title.
+For a Korean song whose title is written in Hangul, always give both forms: the artist's official name with the original Hangul title, and the artist's official name with the official English title (if it has one).
 Examples: "트와이스 하트셰이커" -> ["TWICE Heart Shaker"], "아이유 밤편지" -> ["IU 밤편지", "IU Through the Night"].
 If you do not recognise the song, just transliterate sensibly. Answer with JSON only: {"queries":["..."]}`;
 

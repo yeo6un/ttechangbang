@@ -176,11 +176,25 @@ export async function findSongs(env, q, { rewrite } = {}) {
     } catch {
       alts = [];
     }
-    for (const alt of alts.slice(0, 3)) {
-      if (norm(alt) === norm(q)) continue;
-      const r = await lrclibSongs(env, alt);
-      if (r.songs.length) return { songs: r.songs, via: 'lrclib', rewritten: alt };
+    // 바꾼 검색어 후보를 모두 찾아서 합친다. 같은 곡이 "영어 제목"과 "한글 제목 + 영어 가수 이름"으로 따로 올라와 있는 일이 많아서,
+    // 먼저 걸린 한쪽만 쓰면 다른 판(일본어판 등)만 나오기도 한다. 후보마다 맨 위 결과부터 번갈아 싣는다.
+    const tries = alts.filter((alt) => norm(alt) !== norm(q)).slice(0, 3);
+    const found = await Promise.all(tries.map((alt) => lrclibSongs(env, alt)));
+    const seen = new Set();
+    const songs = [];
+    let rewritten = '';
+    for (let rank = 0; rank < 12 && songs.length < 12; rank++) {
+      found.forEach((r, i) => {
+        const song = r.songs[rank];
+        if (!song || songs.length >= 12) return;
+        const key = `${norm(song.title)}|${norm(song.artist)}`;
+        if (seen.has(key)) return;
+        seen.add(key);
+        songs.push(song);
+        if (!rewritten) rewritten = tries[i];
+      });
     }
+    if (songs.length) return { songs, via: 'lrclib', rewritten };
   }
   return { songs: [], via: 'none', down: first.status !== 200 };
 }

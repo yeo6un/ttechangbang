@@ -341,6 +341,27 @@ try {
       assert.ok(!keys.includes('yt:blockedAAAA')); // 실패한 결과는 저장하지 않는다
     });
 
+    await step('바꾼 검색어 후보가 여럿이면 모두 찾아서 번갈아 합친다 (먼저 걸린 한쪽만 쓰지 않는다)', async () => {
+      const { findSongs } = await import('../server/find.js');
+      const mockFetch = (await import('./mock-find.mjs')).default;
+      const asked = [];
+      const rewrite = async (q) => {
+        asked.push(q);
+        return ['No Such Song At All', 'Ttechang Band Untimed Song', 'Ttechang Band Practice Song', 'ignored fourth'];
+      };
+      const out = await findSongs({ fetch: mockFetch }, '한글로 적은 검색어', { rewrite });
+      assert.deepEqual(asked, ['한글로 적은 검색어']);
+      assert.equal(out.via, 'lrclib');
+      assert.equal(out.rewritten, 'Ttechang Band Untimed Song'); // 결과가 나온 첫 후보
+      assert.deepEqual(out.songs.map((s) => s.lrclibId), [503, 501]);
+      // 후보가 모두 빈손이면 못 찾은 것으로
+      const none = await findSongs({ fetch: mockFetch }, '한글로 적은 검색어', { rewrite: async () => ['Nothing Here'] });
+      assert.deepEqual({ songs: none.songs.length, via: none.via, down: none.down }, { songs: 0, via: 'none', down: false });
+      // AI 가 실패해도 죽지 않는다
+      const broken = await findSongs({ fetch: mockFetch }, '한글로 적은 검색어', { rewrite: async () => Promise.reject(new Error('quota')) });
+      assert.equal(broken.songs.length, 0);
+    });
+
     await step('AI·유튜브 열쇠가 연결된 서버: 한글 검색어를 공식 표기로 바꿔 찾고, 영상도 자동으로 고른다', async () => {
       const dir2 = fs.mkdtempSync(path.join(os.tmpdir(), 'ttb-api2-'));
       const s2 = spawn(process.execPath, [path.join(root, 'server/node-server.mjs')], {
