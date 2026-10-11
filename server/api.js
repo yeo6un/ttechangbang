@@ -435,7 +435,8 @@ async function route(request, env, ctx) {
       // ai=1: 그대로 찾아서 없으면 AI 가 공식 표기로 바꾼 검색어로 한 번 더 (AI 횟수를 아끼려고 따로 부탁할 때만)
       const useAi = p.get('ai') === '1' && !!env.AI && rateLimit('findai:' + ip, 20, HOUR);
       const rewrite = useAi ? (query) => aiSongQueries(env, query) : undefined;
-      return json(await cached(db, `songs:${useAi ? 'ai' : 'raw'}:${q.toLowerCase()}`, DAY, () => findSongs(env, q, { rewrite }), (v) => v.songs.length > 0));
+      // (열쇠 앞의 숫자는 고르는 방법을 바꿀 때 올린다: 예전 방법으로 골라 저장해 둔 결과를 다시 쓰지 않게)
+      return json(await cached(db, `songs2:${useAi ? 'ai' : 'raw'}:${q.toLowerCase()}`, DAY, () => findSongs(env, q, { rewrite }), (v) => v.songs.length > 0));
     }
     if (seg[1] === 'lyrics') {
       // 같은 곡의 표기를 두 가지까지 받는다 (title/artist, title2/artist2)
@@ -445,7 +446,7 @@ async function route(request, env, ctx) {
       ].filter((n) => n.title);
       const want = { names, dur: num(p.get('dur'), 0, 3600, 0), lrclibId: intOf('lrclib') };
       if (!names.length && !want.lrclibId) fail(400, 'no_title', '곡 이름이 필요해요.');
-      const key = `lyrics:${want.lrclibId}:${names.map((n) => `${n.title}|${n.artist}`).join('||').toLowerCase()}:${Math.round(want.dur)}`;
+      const key = `lyrics2:${want.lrclibId}:${names.map((n) => `${n.title}|${n.artist}`).join('||').toLowerCase()}:${Math.round(want.dur)}`;
       // 못 찾은 결과는 저장하지 않는다 (가사가 나중에 올라올 수 있다)
       return json(await cached(db, key, 7 * DAY, () => findLyrics(env, want), (v) => v.found));
     }

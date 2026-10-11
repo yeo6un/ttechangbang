@@ -113,6 +113,32 @@ const hasHangul = (x) => /[가-힣]/.test(x.synced || x.plain);
 /** 같은 곡의 가사 여러 벌 가운데 어느 쪽이 더 쓸 만한지: 시간표가 있는 쪽, 그다음 한글로 적힌 쪽 */
 const lyricRank = (x) => (x.synced ? 2 : 0) + (hasHangul(x) ? 1 : 0);
 
+/** 한 곡으로 보기에는 너무 긴 것(공연 통째, 메들리, 길이를 잘못 적은 것) */
+const TOO_LONG = 600;
+/** 같은 길이(3초 안)로 올라온 가사가 몇 벌인지. 여러 사람이 같은 길이로 올렸으면 그것이 보통 음원의 길이다. */
+const support = (x, list) => list.filter((y) => Math.abs(x.dur - y.dur) <= 3).length;
+
+/**
+ * 같은 곡으로 올라온 가사 여러 벌 가운데 하나를 고른다.
+ * 길이가 다른 판(라이브, 메들리, 길이를 잘못 적은 것)이 섞여 있어서, 가사의 좋고 나쁨만 보고 고르면
+ * 엉뚱한 길이의 것이 뽑혀 시간표가 영상과 안 맞게 된다.
+ * 순서: 한 곡다운 길이 → 시간표가 있는 것 → 많은 사람이 올린 길이 → 한글로 적힌 것.
+ */
+function pickVersion(list) {
+  const key = (x) => [x.dur > TOO_LONG ? 0 : 1, x.synced ? 1 : 0, support(x, list), hasHangul(x) ? 1 : 0];
+  let best = list[0];
+  let bestKey = key(best);
+  for (const x of list.slice(1)) {
+    const k = key(x);
+    const d = k.findIndex((v, i) => v !== bestKey[i]);
+    if (d >= 0 && k[d] > bestKey[d]) {
+      best = x;
+      bestKey = k;
+    }
+  }
+  return best;
+}
+
 async function lrclibSongs(env, q) {
   const r = await getJson(env, `${LRCLIB}/search?q=${enc(q)}`);
   const groups = new Map();
@@ -120,10 +146,10 @@ async function lrclibSongs(env, q) {
     const x = lrc(raw);
     if (!x.id || !x.title || x.instrumental || (!x.plain && !x.synced)) continue;
     const key = `${norm(x.title)}|${norm(x.artist)}`;
-    const cur = groups.get(key);
-    if (!cur || lyricRank(x) > lyricRank(cur)) groups.set(key, x);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(x);
   }
-  const songs = [...groups.values()].slice(0, 12).map((x) => ({
+  const songs = [...groups.values()].slice(0, 12).map(pickVersion).map((x) => ({
     id: 'lr' + x.id,
     lrclibId: x.id,
     title: x.title.slice(0, 120),
@@ -161,7 +187,7 @@ export async function findSongs(env, q, { rewrite } = {}) {
 
 // ───────────── 가사 ─────────────
 
-function scoreLyrics(x, names, dur) {
+function scoreLyrics(x, names, dur, pool = []) {
   if (x.instrumental || (!x.plain && !x.synced)) return -100;
   let title = 0;
   let artist = 0;
@@ -179,6 +205,12 @@ function scoreLyrics(x, names, dur) {
   if (gap <= 2) s += 4;
   else if (gap <= 5) s += 2;
   else if (gap > 20) s -= 3;
+  if (Number.isNaN(gap)) {
+    // 찾는 곡의 길이를 모를 때: 여러 사람이 같은 길이로 올린 판을 먼저, 한 곡으로 보기에 너무 긴 것은 뒤로
+    const same = pool.filter((y) => sameText(y.title, x.title) === 2 && sameArtist(y.artist, x.artist));
+    s += Math.min(2, support(x, same) - 1);
+    if (x.dur > TOO_LONG) s -= 3;
+  }
   return s;
 }
 
@@ -217,8 +249,9 @@ export async function findLyrics(env, want) {
   const best = () => {
     let top = null;
     let topScore = 0;
-    for (const x of pool.values()) {
-      const s = scoreLyrics(x, names, want.dur || 0);
+    const all = [...pool.values()];
+    for (const x of all) {
+      const s = scoreLyrics(x, names, want.dur || 0, all);
       if (s > topScore) {
         top = x;
         topScore = s;

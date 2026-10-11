@@ -275,7 +275,7 @@ try {
   });
 
   if (!EXTERNAL) {
-    await step('곡 찾기: 가사 데이터베이스에서 목록이 나오고, 같은 곡은 시간표 있는 쪽 하나만 남는다', async () => {
+    await step('곡 찾기: 가사 데이터베이스에서 목록이 나오고, 같은 곡은 하나만 남는다 (시간표가 있고 길이가 엉뚱하지 않은 쪽)', async () => {
       assert.equal((await call('GET', '/api/find/songs?q=a')).status, 400);
       const r = await call('GET', '/api/find/songs?q=practice%20song');
       assert.equal(r.status, 200);
@@ -306,6 +306,10 @@ try {
       assert.equal(u.data.found, true);
       assert.equal(u.data.synced, '');
       assert.equal(u.data.plain.split('\n').length, 8);
+      // 길이를 모르고 찾을 때: 공연을 통째로 올린 것처럼 길이가 엉뚱한 판(505)이 아니라, 여럿이 같은 길이로 올린 판을 고른다
+      const nodur = await call('GET', '/api/find/lyrics?title=Practice%20Song&artist=Ttechang%20Band');
+      assert.equal(nodur.data.id, 501);
+      assert.equal(nodur.data.dur, 24);
       // 가수 이름도 길이도 안 맞으면 같은 제목이라도 버린다
       assert.equal((await call('GET', '/api/find/lyrics?title=Practice%20Song&artist=Nobody&dur=120')).data.found, false);
       assert.equal((await call('GET', '/api/find/lyrics?title=No%20Such%20Song&artist=Ttechang%20Band')).data.found, false);
@@ -331,8 +335,8 @@ try {
       const db = new DatabaseSync(path.join(dataDir, 'ttechang.db'));
       const keys = db.prepare('SELECT key FROM cache').all().map((r) => r.key);
       db.close();
-      assert.ok(keys.includes('songs:raw:practice song'));
-      assert.ok(keys.some((k) => k.startsWith('lyrics:')));
+      assert.ok(keys.includes('songs2:raw:practice song'));
+      assert.ok(keys.some((k) => k.startsWith('lyrics2:')));
       assert.ok(keys.includes('yt:ttbMV000001'));
       assert.ok(!keys.includes('yt:blockedAAAA')); // 실패한 결과는 저장하지 않는다
     });
