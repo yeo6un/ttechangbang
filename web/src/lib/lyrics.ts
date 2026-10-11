@@ -19,8 +19,9 @@ export function parseLyrics(raw: string): ParsedLyrics {
     if (!line) continue;
     const m = LRC.exec(line);
     if (m) {
-      const text = m[2].trim();
-      if (!text) continue;
+      const text = m[2].trim().slice(0, 140);
+      // 글자가 하나도 없는 줄(빈 줄, 간주 표시 기호만 있는 줄)은 가사가 아니다
+      if (!/[\p{L}\p{N}]/u.test(text)) continue;
       for (const tm of m[1].matchAll(/\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]/g)) {
         const frac = tm[3] ? Number('0.' + tm[3]) : 0;
         texts.push(text);
@@ -71,6 +72,128 @@ export function evenStarts(texts: string[], dur: number, lead = 0.6, tail = 0.8)
 }
 
 const round3 = (v: number) => Math.round(v * 1000) / 1000;
+
+/** 이미 맞춘 줄들을 통째로 앞뒤로 민다 (가사 전체가 노래보다 빠르거나 느릴 때) */
+export function shiftLines(lines: Line[], delta: number, dur: number): Line[] {
+  if (!lines.length) return lines;
+  // 첫 줄이 0초 앞으로, 마지막 줄이 끝 뒤로 넘어가지 않는 만큼만 민다
+  const lo = -Math.min(...lines.map((l) => l.t0));
+  const hi = dur - 0.4 - Math.max(...lines.map((l) => l.t0));
+  const d = Math.max(lo, Math.min(hi, delta));
+  return lines.map((l) => ({ ...l, t0: round3(l.t0 + d), t1: round3(Math.min(dur, Math.max(l.t0 + d + 0.2, l.t1 + d))) }));
+}
+
+// ───────────── 찾아온 가사(줄별 시간표 포함) 다루기 ─────────────
+
+export interface SyncLine {
+  /** 곡 처음 기준 시작 시각(초) */
+  t: number;
+  text: string;
+  /** 가사 파일에 "여기서 끝난다"는 표시가 있었으면 그 시각 */
+  end: number | null;
+}
+
+const STAMP = /\[(\d{1,3}):(\d{1,2})(?:[.:](\d{1,3}))?\]/g;
+
+/** 시간표 달린 가사(LRC)를 줄 목록으로. 글자가 없는 시간표 줄은 "앞 줄이 여기서 끝난다"는 표시로 쓴다. */
+export function parseSynced(lrc: string): SyncLine[] {
+  const rows: { t: number; text: string }[] = [];
+  for (const rawLine of String(lrc || '').replace(/\r/g, '').split('\n')) {
+    const m = LRC.exec(rawLine.trim());
+    if (!m) continue;
+    // 글자마다 시각을 적어 둔 표기(<00:12.34>)는 지운다
+    const text = m[2].replace(/<\d{1,3}:\d{1,2}(?:[.:]\d{1,3})?>/g, '').replace(/\s+/g, ' ').trim().slice(0, 140);
+    for (const tm of m[1].matchAll(STAMP)) {
+      const frac = tm[3] ? Number('0.' + tm[3]) : 0;
+      rows.push({ t: Number(tm[1]) * 60 + Number(tm[2]) + frac, text });
+    }
+  }
+  rows.sort((a, b) => a.t - b.t);
+  const out: SyncLine[] = [];
+  for (const r of rows) {
+    if (/[\p{L}\p{N}]/u.test(r.text)) out.push({ t: r.t, text: r.text, end: null });
+    else if (out.length && out[out.length - 1].end === null && r.t > out[out.length - 1].t) out[out.length - 1].end = r.t;
+  }
+  return out;
+}
+
+/** 줄이 끝나는 시각: 끝 표시 · 다음 줄 직전 · 글자 수로 어림한 길이 가운데 가장 이른 것 */
+export function syncLineEnd(lines: SyncLine[], i: number): number {
+  const l = lines[i];
+  const next = i + 1 < lines.length ? lines[i + 1].t - 0.04 : Infinity;
+  const natural = l.t + estDur(l.text) * 1.6 + 1;
+  return Math.max(l.t + 0.4, Math.min(l.end ?? Infinity, next, natural));
+}
+
+/**
+ * 부를 구간을 미리 골라 준다: 처음부터 첫 후렴이 끝나는 곳까지(너무 길면 후렴 앞쪽을 줄인다).
+ * 후렴은 "가사가 되풀이되는 줄이 이어진 첫 묶음"으로 어림한다. 못 찾으면 앞에서부터 target 초쯤.
+ */
+export function suggestRange(lines: SyncLine[], target = 70): { a: number; b: number } {
+  const n = lines.length;
+  if (n === 0) return { a: 0, b: 0 };
+  const key = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+  const freq = new Map<string, number>();
+  for (const l of lines) {
+    const k = key(l.text);
+    if (k.length >= 2) freq.set(k, (freq.get(k) || 0) + 1);
+  }
+  const rep = lines.map((l) => (freq.get(key(l.text)) || 0) >= 2);
+  let i0 = -1;
+  let i1 = -1;
+  for (let i = 0; i < n && i0 < 0; i++) {
+    if (!rep[i]) continue;
+    let j = i;
+    while (j + 1 < n && rep[j + 1] && lines[j + 1].t - syncLineEnd(lines, j) < 6) j++;
+    if (j > i && syncLineEnd(lines, j) - lines[i].t >= 8) {
+      i0 = i;
+      i1 = j;
+    } else {
+      i = j;
+    }
+  }
+  if (i0 >= 0) {
+    const end = syncLineEnd(lines, i1);
+    let a = i0;
+    while (a > 0 && end - lines[a - 1].t <= target + 12) a--;
+    // 후렴만 덩그러니 남지 않게, 줄이 너무 적으면 앞쪽을 조금 더 넣는다
+    while (a > 0 && i1 - a + 1 < 4) a--;
+    return { a, b: i1 };
+  }
+  let b = 0;
+  while (b + 1 < n && syncLineEnd(lines, b + 1) - lines[0].t <= target) b++;
+  return { a: 0, b: Math.max(b, Math.min(n - 1, 3)) };
+}
+
+export interface RangePick {
+  /** 영상(또는 음원) 안에서 구간이 시작하는 위치와 길이(초) */
+  start: number;
+  dur: number;
+  lines: Line[];
+}
+
+/**
+ * 고른 줄 범위(a~b)를 방에 넣을 구간과 줄로 바꾼다.
+ * shift: 가사 시각에 더하는 값(초) — 영상이 음원보다 늦게 시작하면 양수.
+ * total: 영상 전체 길이(모르면 0).
+ */
+export function rangeToLines(sync: SyncLine[], a: number, b: number, shift: number, total = 0, lead = 1, tail = 1.2): RangePick {
+  const lo = Math.max(0, Math.min(a, b));
+  const hi = Math.min(sync.length - 1, Math.max(a, b));
+  const start = Math.max(0, sync[lo].t + shift - lead);
+  let end = syncLineEnd(sync, hi) + shift + tail;
+  if (total > 0) end = Math.min(total, end);
+  const dur = Math.max(1, end - start);
+  const lines: Line[] = [];
+  for (let i = lo; i <= hi; i++) {
+    const t0 = Math.max(0, sync[i].t + shift - start);
+    if (t0 >= dur - 0.2) break;
+    let t1 = Math.min(dur, syncLineEnd(sync, i) + shift - start);
+    if (t1 - t0 < 0.4) t1 = Math.min(dur, t0 + 0.4);
+    lines.push({ id: newLineId(), t0: round3(t0), t1: round3(t1), text: sync[i].text, seats: [] });
+  }
+  return { start: round3(start), dur: round3(dur), lines };
+}
 
 // ───────────── 받아쓴 단어 ↔ 가사 정렬 ─────────────
 

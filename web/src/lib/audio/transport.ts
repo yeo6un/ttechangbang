@@ -20,8 +20,27 @@ export interface MixSettings {
 }
 
 export const DEFAULT_MIX: MixSettings = { backing: 0.8, seats: {}, echo: 0.18 };
+/** 유튜브 영상은 파일 반주보다 크게 들려서 처음 크기를 조금 낮게 잡는다 */
+export const DEFAULT_YT_MIX: MixSettings = { backing: 0.6, seats: {}, echo: 0.18 };
 
-interface Graph {
+/** 방의 반주와 녹음을 함께 트는 재생기. 파일 반주(Transport)와 유튜브 반주(YtDeck)가 같은 모양을 갖는다. */
+export interface Deck {
+  readonly ctx: AudioContext;
+  readonly duration: number;
+  readonly playing: boolean;
+  setTakes(takes: PlayTake[]): void;
+  setMix(mix: MixSettings): void;
+  /** 파일 반주는 바로 시작하고, 유튜브 반주는 영상이 실제로 돌기 시작하면 끝나는 약속을 돌려준다 */
+  play(from: number, opts?: PlayOptions): number | Promise<number>;
+  pause(): void;
+  stop(): void;
+  seek(pos: number): void;
+  rawPosition(): number;
+  position(): number;
+  dispose(): void;
+}
+
+export interface Graph {
   backingGain: GainNode;
   seatGains: Map<number, GainNode>;
   voiceBus: GainNode;
@@ -52,7 +71,7 @@ function impulse(ctx: BaseAudioContext): AudioBuffer {
   return buf;
 }
 
-function buildGraph(ctx: BaseAudioContext, mix: MixSettings, dest: AudioNode): Graph {
+export function buildGraph(ctx: BaseAudioContext, mix: MixSettings, dest: AudioNode): Graph {
   const master = ctx.createGain();
   const limiter = ctx.createDynamicsCompressor();
   limiter.threshold.value = -6;
@@ -74,7 +93,7 @@ function buildGraph(ctx: BaseAudioContext, mix: MixSettings, dest: AudioNode): G
   return { backingGain, seatGains: new Map(), voiceBus, wet, master };
 }
 
-function seatGain(ctx: BaseAudioContext, g: Graph, mix: MixSettings, seat: number): GainNode {
+export function seatGain(ctx: BaseAudioContext, g: Graph, mix: MixSettings, seat: number): GainNode {
   let node = g.seatGains.get(seat);
   if (!node) {
     node = ctx.createGain();
@@ -85,7 +104,7 @@ function seatGain(ctx: BaseAudioContext, g: Graph, mix: MixSettings, seat: numbe
   return node;
 }
 
-function scheduleTakes(ctx: BaseAudioContext, g: Graph, mix: MixSettings, takes: PlayTake[], tZero: number, from: number, sources: AudioScheduledSourceNode[]) {
+export function scheduleTakes(ctx: BaseAudioContext, g: Graph, mix: MixSettings, takes: PlayTake[], tZero: number, from: number, sources: AudioScheduledSourceNode[]) {
   for (const t of takes) {
     const end = t.start + t.buffer.duration;
     if (end <= from) continue;
@@ -131,7 +150,7 @@ interface TestHooks {
 }
 const hooks = () => (window as unknown as { __ttbTest?: TestHooks }).__ttbTest;
 
-export class Transport {
+export class Transport implements Deck {
   private graph: Graph;
   private sources: AudioScheduledSourceNode[] = [];
   private timer = 0;
@@ -285,15 +304,17 @@ export class Transport {
 }
 
 /** 완성본을 파일로 뽑기 위해 실제 시간보다 빠르게 섞는다 */
-export async function renderMix(song: AudioBuffer, takes: PlayTake[], mix: MixSettings, sampleRate = 44100): Promise<AudioBuffer> {
+export async function renderMix(song: AudioBuffer | null, takes: PlayTake[], mix: MixSettings, sampleRate = 44100, duration = song?.duration ?? 0): Promise<AudioBuffer> {
   const tail = 1.2;
-  const length = Math.ceil((song.duration + tail) * sampleRate);
+  const length = Math.ceil((Math.max(duration, 1) + tail) * sampleRate);
   const off = new OfflineAudioContext(2, length, sampleRate);
   const g = buildGraph(off, mix, off.destination);
-  const src = off.createBufferSource();
-  src.buffer = song;
-  src.connect(g.backingGain);
-  src.start(0);
+  if (song) {
+    const src = off.createBufferSource();
+    src.buffer = song;
+    src.connect(g.backingGain);
+    src.start(0);
+  }
   scheduleTakes(off, g, mix, takes, 0, 0, []);
   const out = await off.startRendering();
   // 파일에서는 소리가 넘쳐 깨지지 않게 전체 크기를 맞춘다. MP3 로 줄이면 꼭대기가 조금 더 솟을 수 있어서

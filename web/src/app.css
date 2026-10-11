@@ -453,6 +453,14 @@ input[type='range']::-moz-range-thumb {
 .pill-ok {
   color: var(--song);
 }
+/* 아이콘 + 긴 글: 글이 길어도 아이콘 옆에서 줄을 바꾼다 */
+.pill-line {
+  flex-wrap: nowrap;
+  align-items: flex-start;
+}
+.pill-line .icon {
+  margin-top: 3px;
+}
 .pill-bad {
   color: #ffb0b8;
   background: rgba(255, 90, 106, 0.12);
@@ -1355,8 +1363,11 @@ input[type='range']::-moz-range-thumb {
   background: var(--me);
   color: var(--bg);
 }
-.play-btn:active {
+.play-btn:active:not(:disabled) {
   transform: scale(0.96);
+}
+.play-btn:disabled {
+  opacity: 0.6;
 }
 .play-btn .spinner {
   border-color: rgba(22, 18, 38, 0.25);
@@ -2027,6 +2038,494 @@ input[type='range']::-moz-range-thumb {
   height: 100%;
   background: var(--me);
   transition: width 0.2s;
+}
+
+/* ───────── 유튜브 영상 ───────── */
+.yt-frame {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.yt-box {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  /* 유튜브 플레이어는 가로·세로 200px 보다 작으면 안 된다 */
+  min-height: 200px;
+  border-radius: 16px;
+  overflow: hidden;
+  background: #000;
+}
+.yt-host {
+  position: absolute;
+  inset: 0;
+}
+.yt-host iframe,
+.yt-host .yt-mount {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  display: block;
+}
+.yt-cover {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 16px;
+  text-align: center;
+  background: #0d0a18;
+  color: var(--ink-2);
+  font-size: 14.5px;
+}
+.yt-cover-error {
+  color: #ffb0b8;
+}
+.yt-note {
+  padding: 10px 14px;
+  border-radius: 14px;
+  background: rgba(255, 201, 60, 0.14);
+  color: #ffe08a;
+  font-size: 14px;
+  font-weight: 700;
+}
+.yt-note-bad {
+  background: rgba(255, 90, 106, 0.12);
+  color: #ffb0b8;
+}
+/* 방·완성본 화면: 재생 카드 맨 위에 영상을 꽉 채운다 */
+.player-card > .yt-frame {
+  margin: -16px -16px 0;
+}
+.player-card > .yt-frame .yt-box {
+  border-radius: var(--r-card) var(--r-card) 0 0;
+}
+.player-card > .yt-frame .yt-note {
+  margin: 0 12px;
+}
+/* 녹음 화면: 영상은 늘 같은 자리(틀의 첫 칸)에 두고, 보이는 순서만 위쪽 막대 다음으로 바꾼다 */
+.record > *,
+.stage > * {
+  order: 2;
+}
+.record > .topbar,
+.stage > .stage-top {
+  order: 0;
+}
+.record > .yt-frame,
+.stage > .yt-frame {
+  order: 1;
+}
+.stage > .yt-frame {
+  margin-top: 8px;
+}
+.stage.has-video .stage-status {
+  height: 46px;
+  margin-top: 8px;
+}
+.stage.has-video .stage-lines {
+  grid-template-rows: auto auto auto;
+  gap: 12px;
+  padding-bottom: 0;
+  overflow: hidden;
+}
+.stage.has-video .k-slot-0 {
+  display: none;
+}
+.stage.has-video .k-line p {
+  font-size: 17px;
+}
+.stage.has-video .k-line.is-now p {
+  font-size: clamp(22px, 6.6vw, 32px);
+}
+.stage-prep {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  text-align: center;
+  font-size: 14.5px;
+  line-height: 1.35;
+}
+.stage-prep.is-col {
+  flex-direction: column;
+  gap: 2px;
+}
+.stage-prep-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.stage-prep small {
+  font-size: 13px;
+  font-weight: 600;
+}
+.room-artist {
+  color: var(--ink-2);
+  font-weight: 600;
+}
+
+/* ───────── 방 만들기: 곡 찾기 · 영상 고르기 · 구간 고르기 ───────── */
+.search-row,
+.link-row {
+  display: flex;
+  gap: 8px;
+}
+.search-row .input,
+.link-row .input {
+  flex: 1;
+  min-width: 0;
+}
+.search-row .btn,
+.link-row .btn {
+  min-height: 52px;
+  padding-inline: 16px;
+  white-space: nowrap;
+}
+input[type='search']::-webkit-search-cancel-button {
+  -webkit-appearance: none;
+}
+.link-input {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.song-list,
+.alt-list {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 6px;
+}
+.song-row,
+.alt-row {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  text-align: left;
+  min-height: 60px;
+  padding: 10px 14px 10px 10px;
+  border-radius: 16px;
+  background: var(--bg-2);
+}
+.song-row:active,
+.alt-row:active {
+  background: var(--bg-3);
+}
+.song-note {
+  width: 40px;
+  height: 40px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border-radius: 12px;
+  background: var(--bg-3);
+  color: var(--song);
+}
+.song-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.3;
+}
+.song-text strong {
+  font-size: 16px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.song-text small {
+  color: var(--ink-3);
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.song-side {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+}
+.song-side small {
+  color: var(--ink-3);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+.song-side em {
+  font-style: normal;
+  font-size: 11.5px;
+  font-weight: 800;
+  color: var(--song);
+  white-space: nowrap;
+}
+.song-card {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 6px 10px 10px;
+  border-radius: 16px;
+  background: var(--bg-2);
+}
+.alt-row img {
+  width: 96px;
+  height: 54px;
+  flex: none;
+  border-radius: 10px;
+  object-fit: cover;
+  background: var(--bg-3);
+}
+.other-ways {
+  margin-top: 10px;
+}
+.card-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 16px;
+  font-weight: 800;
+}
+.lead-sm {
+  color: var(--ink-2);
+  font-size: 15px;
+}
+.video-meta {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.35;
+  margin-top: -6px;
+}
+.video-meta strong {
+  font-size: 16px;
+}
+.video-meta small {
+  color: var(--ink-3);
+  font-size: 13px;
+}
+.steps-list {
+  counter-reset: st;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+}
+.steps-list li {
+  counter-increment: st;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  color: var(--ink-2);
+  font-size: 15px;
+}
+.steps-list li::before {
+  content: counter(st);
+  width: 24px;
+  height: 24px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--bg-3);
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 800;
+}
+.steps-list li > * {
+  flex: 1;
+  min-width: 0;
+}
+.steps-list li > p {
+  padding-top: 1px;
+}
+.steps-list li > .btn {
+  margin-top: -6px;
+}
+/* 구간 고르는 동안에는 영상이 따라 내려온다 (화면이 낮은 기기에서는 가리는 게 많아 그냥 둔다) */
+.create .yt-frame.is-sticky {
+  position: sticky;
+  top: 0;
+  z-index: 6;
+  margin: 0 calc(var(--gutter) * -1);
+  padding: 0 var(--gutter) 10px;
+  background: var(--bg);
+}
+@media (max-height: 660px) {
+  .create .yt-frame.is-sticky {
+    position: static;
+  }
+}
+.seg-toggle {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 16px;
+  background: var(--bg-2);
+}
+.seg-toggle button {
+  min-height: 44px;
+  border-radius: 12px;
+  color: var(--ink-2);
+  font-size: 14.5px;
+  font-weight: 700;
+}
+.seg-toggle button.is-on {
+  background: var(--ink);
+  color: var(--bg);
+}
+.range-list {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 3px;
+}
+.range-row {
+  display: flex;
+  align-items: center;
+  border-radius: 12px;
+  color: var(--ink-3);
+  scroll-margin: 250px 0 190px;
+}
+.range-row.is-in {
+  background: var(--bg-2);
+  color: var(--ink);
+}
+.range-row.is-now {
+  box-shadow: inset 4px 0 0 var(--song);
+}
+.range-row.is-now .range-text {
+  color: var(--song);
+}
+.range-pick {
+  flex: 1;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 2.6em minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  text-align: left;
+  min-height: 46px;
+  padding: 6px 2px 6px 12px;
+  color: inherit;
+}
+.range-pick small {
+  color: var(--ink-3);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+.range-text {
+  font-weight: 600;
+}
+.range-tags {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+}
+.range-tags em {
+  font-style: normal;
+  font-size: 11.5px;
+  font-weight: 800;
+  padding: 3px 7px;
+  border-radius: 8px;
+  background: var(--ink);
+  color: var(--bg);
+  white-space: nowrap;
+}
+.range-row .icon-btn {
+  color: var(--ink-2);
+}
+.range-sum {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  font-variant-numeric: tabular-nums;
+}
+.range-sum strong {
+  font-family: var(--display);
+  font-weight: 400;
+  font-size: 22px;
+}
+.range-sum span {
+  color: var(--ink-2);
+  font-size: 13.5px;
+}
+.is-bad,
+.range-sum.is-bad span {
+  color: #ffb0b8;
+}
+.shift-row {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+}
+.shift-row .btn {
+  padding-inline: 4px;
+  font-variant-numeric: tabular-nums;
+}
+.shift-all {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.shift-all span {
+  margin-right: auto;
+  color: var(--ink-2);
+  font-size: 14px;
+  font-weight: 700;
+}
+.range-time .trim-times {
+  margin-top: 0;
+}
+.mark-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.mark-row .btn {
+  padding-inline: 8px;
+}
+.fine-grid {
+  display: grid;
+  grid-template-columns: 3em 1fr 1fr;
+  align-items: center;
+  gap: 4px 6px;
+  color: var(--ink-2);
+  font-size: 14px;
+  font-weight: 700;
+}
+.fine-grid .btn {
+  background: var(--bg-3);
+  color: var(--ink);
+}
+.sync-card summary output {
+  margin-left: 8px;
+  font-weight: 800;
+  color: var(--song);
+  font-variant-numeric: tabular-nums;
+}
+.diag {
+  color: var(--ink-3);
+  font-size: 12px;
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+  word-break: break-all;
+}
+.diag summary {
+  cursor: pointer;
+}
+.diag pre {
+  margin: 6px 0 0;
+  padding: 10px;
+  border-radius: 10px;
+  background: var(--bg-3);
+  font: inherit;
+  white-space: pre-wrap;
 }
 
 @media (min-width: 700px) {

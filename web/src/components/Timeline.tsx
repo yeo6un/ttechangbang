@@ -106,7 +106,7 @@ export function Timeline({ dur, songPeaks, seatCount, lines, takes, names, mySea
         c.font = '10px system-ui, sans-serif';
         c.fillStyle = '#8A80B0';
         c.textBaseline = 'top';
-        const step = dur > 70 ? 20 : dur > 35 ? 10 : 5;
+        const step = dur > 240 ? 60 : dur > 130 ? 30 : dur > 70 ? 20 : dur > 35 ? 10 : 5;
         for (let t = 0; t < dur - step * 0.4; t += step) {
           const x = X(t);
           c.fillRect(x, RULER - 4, 1, 4);
@@ -118,7 +118,13 @@ export function Timeline({ dur, songPeaks, seatCount, lines, takes, names, mySea
       roundRect(c, 0, RULER, width, SONG_H, 7);
       c.fillStyle = shade(SONG, 0.42);
       c.fill();
-      drawWave(c, song, 3, width - 3, RULER + SONG_H / 2, SONG_H / 2 - 4, SONG);
+      if (song.length) {
+        drawWave(c, song, 3, width - 3, RULER + SONG_H / 2, SONG_H / 2 - 4, SONG);
+      } else {
+        // 유튜브 영상을 반주로 쓰는 방은 파형이 없다: 고른 점선으로 "여기 원곡이 흐른다"만 보여 준다
+        c.fillStyle = rgba(SONG, 0.7);
+        for (let x = 6; x < width - 6; x += 5) c.fillRect(x, RULER + SONG_H / 2 - 1.5, 2.5, 3);
+      }
 
       for (let s = 0; s < seatCount; s++) {
         const y = RULER + SONG_H + GAP + s * (ROW_H + GAP);

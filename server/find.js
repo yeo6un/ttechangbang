@@ -108,6 +108,11 @@ const lrc = (r) => ({
   synced: typeof r?.syncedLyrics === 'string' ? r.syncedLyrics : '',
 });
 
+/** 한글 가사인지. 같은 곡이 한글판과 로마자 표기판으로 함께 올라와 있으면 한글판을 고르려는 것이다. */
+const hasHangul = (x) => /[가-힣]/.test(x.synced || x.plain);
+/** 같은 곡의 가사 여러 벌 가운데 어느 쪽이 더 쓸 만한지: 시간표가 있는 쪽, 그다음 한글로 적힌 쪽 */
+const lyricRank = (x) => (x.synced ? 2 : 0) + (hasHangul(x) ? 1 : 0);
+
 async function lrclibSongs(env, q) {
   const r = await getJson(env, `${LRCLIB}/search?q=${enc(q)}`);
   const groups = new Map();
@@ -116,8 +121,7 @@ async function lrclibSongs(env, q) {
     if (!x.id || !x.title || x.instrumental || (!x.plain && !x.synced)) continue;
     const key = `${norm(x.title)}|${norm(x.artist)}`;
     const cur = groups.get(key);
-    // 같은 곡이면 시간표가 있는 쪽을 남긴다
-    if (!cur || (!cur.synced && x.synced)) groups.set(key, x);
+    if (!cur || lyricRank(x) > lyricRank(cur)) groups.set(key, x);
   }
   const songs = [...groups.values()].slice(0, 12).map((x) => ({
     id: 'lr' + x.id,
@@ -171,6 +175,7 @@ function scoreLyrics(x, names, dur) {
   if (!artist && !(gap <= 3)) return -100;
   let s = title * 2 + artist * 2;
   if (x.synced) s += 3;
+  if (hasHangul(x)) s += 3;
   if (gap <= 2) s += 4;
   else if (gap <= 5) s += 2;
   else if (gap > 20) s -= 3;

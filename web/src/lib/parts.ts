@@ -26,6 +26,8 @@ export interface Pass {
 
 /** 줄 사이가 이보다 가까우면 한 번에 이어서 녹음한다 */
 export const PASS_GAP = 6;
+/** 한 번에 녹음하는 묶음이 이보다 길어지면 나눈다 (틀리면 처음부터 다시 불러야 하니까) */
+export const PASS_MAX = 75;
 
 export const SEATS = [
   { name: '빨강', color: '#FF4D5E' },
@@ -58,7 +60,7 @@ export function passesForSeat(lines: Line[], seat: number): Pass[] {
   const passes: Pass[] = [];
   for (const line of mine) {
     const last = passes[passes.length - 1];
-    if (last && line.t0 - last.t1 < PASS_GAP) {
+    if (last && line.t0 - last.t1 < PASS_GAP && line.t1 - last.t0 <= PASS_MAX) {
       last.lines.push(line);
       last.t1 = Math.max(last.t1, line.t1);
     } else {
@@ -314,6 +316,13 @@ export function blankLines(dur: number, bpm = 0, beat0 = 0): Line[] {
   }
   if (!out.length) out.push({ id: newLineId(), t0: 0, t1: dur, text: '', seats: [] });
   return out;
+}
+
+/** 길이를 말로: 45초, 3분 5초 */
+export function fmtSpan(sec: number): string {
+  const s = Math.max(0, Math.round(sec));
+  if (s < 90) return `${s}초`;
+  return s % 60 ? `${Math.floor(s / 60)}분 ${s % 60}초` : `${s / 60}분`;
 }
 
 export function fmtTime(sec: number): string {

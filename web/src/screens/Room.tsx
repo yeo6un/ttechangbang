@@ -2,12 +2,13 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Timeline } from '../components/Timeline';
 import { api, ApiError, type Room } from '../lib/api';
-import { fmtTime, isAll, roomProgress, seatColor, seatName, type Line } from '../lib/parts';
+import { fmtSpan, fmtTime, isAll, roomProgress, seatColor, seatName, type Line } from '../lib/parts';
 import { fmtCode, navigate, roomLink } from '../lib/router';
 import { useRoom } from '../lib/room';
 import { useRoomAudio } from '../lib/roomAudio';
 import { daysLeft, seatInfos, seatNames, type SeatInfo } from '../lib/roomView';
 import { store } from '../lib/store';
+import { YtFrame, YtTapNote } from '../lib/yt/useYt';
 import { copyText, Icon, InAppNotice, SeatDot, Sheet, Spinner, TopBar, useRaf, useToast } from '../ui';
 
 export function RoomScreen({ code }: { code: string }) {
@@ -113,6 +114,7 @@ export function RoomScreen({ code }: { code: string }) {
 
       <header className="room-head">
         <h1 className="title">{room.title}</h1>
+        {room.song.artist && <p className="room-artist">{room.song.artist}</p>}
         <p className="meta meta-split">
           <span>{activeSeats > 0 ? `${activeSeats}파트 중 ${finishedSeats}파트 녹음 완료` : '파트 준비 중'}</span>
           <span>{daysLeft(room)}</span>
@@ -152,15 +154,25 @@ export function RoomScreen({ code }: { code: string }) {
           {mySeat === null && <SeatPicker seats={seats} busy={busy} onPick={takeSeat} current={null} />}
 
           <section className="card player-card">
+            {audio.isYt && <YtFrame yt={audio.yt} note={audio.needTap ? <YtTapNote after="그다음부터는 여기 버튼으로 움직여요." /> : null} />}
             <div className="player-row">
-              <button className="play-btn" onClick={audio.toggle} disabled={audio.loading} aria-label={audio.playing ? '멈추기' : '재생'}>
-                {audio.loading ? <span className="spinner" /> : <Icon name={audio.playing ? 'pause' : 'play'} size={26} />}
+              {/* 유튜브 반주: 영상이 다 불러와질 때까지는 누를 수 없다. 파일 반주: 소리를 받는 동안 돌아가는 표시. */}
+              <button className="play-btn" onClick={audio.toggle} disabled={audio.isYt ? !audio.yt.player : audio.loading} aria-label={audio.playing ? '멈추기' : '재생'}>
+                {(audio.isYt ? audio.yt.loading : audio.loading) ? <span className="spinner" /> : <Icon name={audio.playing ? 'pause' : 'play'} size={26} />}
               </button>
               <div className="player-text">
                 <strong>
                   <Clock getPosition={audio.getPosition} active={audio.playing} /> / {fmtTime(room.song.dur)}
                 </strong>
-                <span>{hidden ? '지금은 반주와 내 녹음만 들려요' : room.takes.length ? '반주와 지금까지의 녹음이 함께 나와요' : '아직 녹음이 없어 반주만 나와요'}</span>
+                <span>
+                  {audio.isYt && audio.playing && audio.loading
+                    ? '영상을 준비하는 중…'
+                    : hidden
+                      ? '지금은 반주와 내 녹음만 들려요'
+                      : room.takes.length
+                        ? `${audio.isYt ? '유튜브 영상' : '반주'}과 지금까지의 녹음이 함께 나와요`
+                        : `아직 녹음이 없어 ${audio.isYt ? '영상' : '반주'}만 나와요`}
+                </span>
               </div>
             </div>
             <Timeline
@@ -384,7 +396,7 @@ function JoinCard({ room, onJoin, busy }: { room: Room; onJoin: (name: string) =
     >
       <h2>{host ? `${host.name} 님이 만든 방이에요` : '초대받은 방이에요'}</h2>
       <p className="hint">
-        {room.seatCount}명이 파트를 나눠 부르는 {Math.round(room.song.dur)}초짜리 구간이에요. 이름만 넣으면 바로 들어가요.
+        {room.seatCount}명이 파트를 나눠 부르는 {fmtSpan(room.song.dur)}짜리 {room.song.dur > 150 ? '노래' : '구간'}예요. 이름만 넣으면 바로 들어가요.
       </p>
       <label className="field">
         <span>내 이름</span>

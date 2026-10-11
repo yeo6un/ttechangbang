@@ -27,15 +27,71 @@ export interface Take {
   retakes: number;
 }
 
+/** 유튜브 영상을 반주로 쓰는 방: 영상 번호와, 영상 안에서 구간이 시작하는 위치 */
+export interface YtRef {
+  id: string;
+  start: number;
+  /** 영상 전체 길이(초). 모르면 0. */
+  len: number;
+  title: string;
+  author: string;
+}
+
 export interface SongMeta {
   blob: string | null;
   dur: number;
   lead: number;
   peaks: string;
   name: string;
+  artist?: string;
+  art?: string;
   bpm: number;
   beat0: number;
   demo: boolean;
+  yt?: YtRef;
+}
+
+export interface ServerConfig {
+  ai: boolean;
+  /** 가수·곡 이름으로 유튜브 영상까지 자동으로 찾을 수 있는지 (서버에 YouTube API 열쇠가 있을 때) */
+  ytSearch?: boolean;
+  limits: { songSeconds: number; ytSeconds?: number; seats: number; roomDays: number };
+  now: number;
+}
+
+/** 검색으로 찾은 곡 */
+export interface FoundSong {
+  id: string;
+  title: string;
+  artist: string;
+  album: string;
+  dur: number;
+  art: string;
+  itunesId?: number;
+  lrclibId?: number;
+  /** 가사가 있는지 미리 아는 경우 */
+  lyrics?: 'synced' | 'plain';
+}
+
+export interface FoundLyrics {
+  found: boolean;
+  id?: number;
+  title?: string;
+  artist?: string;
+  dur?: number;
+  /** 줄별 시간표가 달린 가사(LRC). 없으면 빈 글. */
+  synced?: string;
+  plain?: string;
+  source?: string;
+  down?: boolean;
+}
+
+export interface FoundVideo {
+  id: string;
+  title: string;
+  author: string;
+  thumb: string;
+  len: number;
 }
 
 export interface Room {
@@ -103,7 +159,25 @@ async function request<T>(method: string, path: string, opts: { who?: Identity |
 }
 
 export const api = {
-  config: () => request<{ ai: boolean; limits: { songSeconds: number; seats: number; roomDays: number }; now: number }>('GET', '/config'),
+  config: () => request<ServerConfig>('GET', '/config'),
+
+  findSongs: (q: string, ai = false) => request<{ songs: FoundSong[]; via: string; rewritten?: string; down?: boolean }>('GET', `/find/songs?q=${encodeURIComponent(q)}${ai ? '&ai=1' : ''}`),
+  findLyrics(want: { names?: { title: string; artist: string }[]; dur?: number; lrclibId?: number }) {
+    const p = new URLSearchParams();
+    (want.names || []).slice(0, 2).forEach((n, i) => {
+      p.set(i ? 'title2' : 'title', n.title);
+      p.set(i ? 'artist2' : 'artist', n.artist);
+    });
+    if (want.dur) p.set('dur', String(Math.round(want.dur)));
+    if (want.lrclibId) p.set('lrclib', String(want.lrclibId));
+    return request<FoundLyrics>('GET', `/find/lyrics?${p}`);
+  },
+  findVideo: (want: { title: string; artist: string; dur?: number }) =>
+    request<({ found: true; alts: FoundVideo[]; via: string } & FoundVideo) | { found: false; reason?: string }>(
+      'GET',
+      `/find/video?title=${encodeURIComponent(want.title)}&artist=${encodeURIComponent(want.artist)}${want.dur ? `&dur=${Math.round(want.dur)}` : ''}`,
+    ),
+  ytInfo: (url: string) => request<{ ok: boolean; id?: string; title?: string; author?: string; thumb?: string; reason?: string; unverified?: boolean }>('GET', `/find/yt?url=${encodeURIComponent(url)}`),
 
   createRoom: (body: { title: string; hostName: string; seatCount: number; song: Omit<SongMeta, 'blob'> }) =>
     request<{ code: string; member: Identity; room: Room }>('POST', '/rooms', { body }),

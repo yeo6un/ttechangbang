@@ -1,6 +1,6 @@
 // 이 기기에만 저장하는 것들: 방별 내 열쇠, 최근 방, 이름, 녹음 설정, 믹서 설정
 import type { Identity } from './api';
-import { DEFAULT_MIX, type MixSettings } from './audio/transport';
+import { DEFAULT_MIX, DEFAULT_YT_MIX, type MixSettings } from './audio/transport';
 
 function read<T>(key: string, fallback: T): T {
   try {
@@ -62,6 +62,13 @@ export const store = {
   }),
   setMic: (v: Partial<{ earphones: boolean; deviceId: string; guide: number; hearOthers: boolean }>) => write('ttb.mic', { ...store.mic(), ...v }),
 
-  mix: (code: string): MixSettings => ({ ...DEFAULT_MIX, ...read<Partial<MixSettings>>(`ttb.mix.${code}`, {}) }),
+  mix: (code: string, yt = false): MixSettings => ({ ...(yt ? DEFAULT_YT_MIX : DEFAULT_MIX), ...read<Partial<MixSettings>>(`ttb.mix.${code}`, {}) }),
   setMix: (code: string, mix: MixSettings) => write(`ttb.mix.${code}`, mix),
+
+  /** 유튜브 반주에서 이 기기만 목소리 전체를 옮겨 듣는 값(ms). 기기마다 소리가 나오는 지연이 달라서 둔다. */
+  ytShift: (): number => {
+    const v = Number(read<number>('ttb.ytshift', 0));
+    return Number.isFinite(v) ? Math.max(-300, Math.min(300, v)) : 0;
+  },
+  setYtShift: (ms: number) => write('ttb.ytshift', ms),
 };

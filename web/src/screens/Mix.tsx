@@ -3,6 +3,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Timeline } from '../components/Timeline';
 import { api, ApiError, type Room, type Take } from '../lib/api';
 import { encodeRaw } from '../lib/audio/codec';
+import { isIOS } from '../lib/audio/context';
 import { loadAudio } from '../lib/audio/library';
 import { renderMix } from '../lib/audio/transport';
 import { fmtTime, roomProgress, seatColor, seatName } from '../lib/parts';
@@ -10,6 +11,7 @@ import { navigate } from '../lib/router';
 import { useRoom } from '../lib/room';
 import { audibleTakes, loadPlayTakes, useRoomAudio } from '../lib/roomAudio';
 import { awards, seatNames } from '../lib/roomView';
+import { YtFrame, YtTapNote } from '../lib/yt/useYt';
 import { Icon, SeatDot, Spinner, TopBar, useRaf, useToast } from '../ui';
 
 export function Mix({ code }: { code: string }) {
@@ -55,6 +57,7 @@ export function Mix({ code }: { code: string }) {
   }
 
   const me = room.me;
+  const isYt = audio.isYt;
   const hidden = room.blind && !room.revealed;
   const progress = roomProgress(room.lines, room.seatCount, room.takes);
   const heard = audibleTakes(room);
@@ -76,16 +79,17 @@ export function Mix({ code }: { code: string }) {
   const shift = (t: Take, delta: number) => run(() => api.patchTake(code, who!, t.id, { offsetMs: Math.max(-500, Math.min(500, t.offsetMs + delta)) }));
 
   const exportMix = async () => {
-    if (!room.song.blob) return;
+    if (!room.song.blob && !isYt) return;
     audio.pause();
     setFile(null);
-    setExporting({ label: '노래를 합치는 중', progress: 0.05 });
+    setExporting({ label: isYt ? '목소리를 합치는 중' : '노래를 합치는 중', progress: 0.05 });
     try {
-      const [song, list] = await Promise.all([loadAudio(code, room.song.blob, who), loadPlayTakes(room, who, heard)]);
-      const mixed = await renderMix(song, list, audio.mix);
+      // 유튜브 반주 방은 영상의 소리를 파일에 담을 수 없어서 목소리만 합친다
+      const [song, list] = await Promise.all([room.song.blob ? loadAudio(code, room.song.blob, who) : Promise.resolve(null), loadPlayTakes(room, who, heard)]);
+      const mixed = await renderMix(song, list, audio.mix, 44100, room.song.dur);
       setExporting({ label: '파일로 만드는 중', progress: 0.3 });
       const bytes = await encodeRaw([mixed.getChannelData(0), mixed.getChannelData(1)], mixed.sampleRate, 2, (p) => setExporting({ label: '파일로 만드는 중', progress: 0.3 + p * 0.7 }));
-      const name = `${room.title.replace(/[\\/:*?"<>|]/g, ' ').trim() || '떼창방'} - 떼창방.mp3`;
+      const name = `${room.title.replace(/[\\/:*?"<>|]/g, ' ').trim() || '떼창방'} - 떼창방${isYt ? ' (목소리)' : ''}.mp3`;
       const f = new File([bytes as Uint8Array<ArrayBuffer>], name, { type: 'audio/mpeg' });
       setFile({ file: f, url: URL.createObjectURL(f) });
     } catch {
@@ -113,15 +117,16 @@ export function Mix({ code }: { code: string }) {
       </header>
 
       <section className="card player-card">
+        {isYt && <YtFrame yt={audio.yt} note={audio.needTap ? <YtTapNote after="그다음부터는 여기 버튼으로 움직여요." /> : null} />}
         <div className="player-row">
-          <button className="play-btn" onClick={audio.toggle} disabled={audio.loading} aria-label={audio.playing ? '멈추기' : '재생'}>
-            {audio.loading ? <span className="spinner" /> : <Icon name={audio.playing ? 'pause' : 'play'} size={26} />}
+          <button className="play-btn" onClick={audio.toggle} disabled={isYt ? !audio.yt.player : audio.loading} aria-label={audio.playing ? '멈추기' : '재생'}>
+            {(isYt ? audio.yt.loading : audio.loading) ? <span className="spinner" /> : <Icon name={audio.playing ? 'pause' : 'play'} size={26} />}
           </button>
           <div className="player-text">
             <strong>
               <Clock getPosition={audio.getPosition} active={audio.playing} /> / {fmtTime(room.song.dur)}
             </strong>
-            <span>타임라인을 누르면 그 자리부터 들을 수 있어요</span>
+            <span>{isYt && audio.playing && audio.loading ? '영상을 준비하는 중…' : '타임라인을 누르면 그 자리부터 들을 수 있어요'}</span>
           </div>
         </div>
         <Timeline dur={room.song.dur} songPeaks={room.song.peaks} seatCount={room.seatCount} lines={room.lines} takes={room.takes} names={names} mySeat={me.seat} playing={audio.playing} getPosition={audio.getPosition} onSeek={audio.seek} />
@@ -145,14 +150,39 @@ export function Mix({ code }: { code: string }) {
       <section className="stack-sm">
         <h2 className="section-title">소리 크기</h2>
         <div className="card mixer">
-          <MixRow label="반주" color="var(--song)" value={audio.mix.backing} max={1.5} onChange={(v) => audio.setMix({ ...audio.mix, backing: v })} id="mix-backing" />
+          <MixRow label={isYt ? '영상 소리' : '반주'} color="var(--song)" value={Math.min(audio.mix.backing, isYt ? 1 : 1.5)} max={isYt ? 1 : 1.5} onChange={(v) => audio.setMix({ ...audio.mix, backing: v })} id="mix-backing" />
           {usedSeats.map((s) => (
             <MixRow key={s} label={names[s] || seatName(s)} color={seatColor(s)} value={audio.mix.seats[s] ?? 1} max={2} onChange={(v) => audio.setMix({ ...audio.mix, seats: { ...audio.mix.seats, [s]: v } })} id={`mix-seat-${s}`} />
           ))}
           <MixRow label="노래방 에코" color="var(--ink-2)" value={audio.mix.echo} max={0.6} onChange={(v) => audio.setMix({ ...audio.mix, echo: v })} id="mix-echo" />
-          <p className="hint">소리 크기는 이 기기에만 저장되고, 저장하는 파일에 그대로 반영돼요.</p>
+          <p className="hint">
+            소리 크기는 이 기기에만 저장되고, 저장하는 파일에 그대로 반영돼요.{isYt && isIOS() ? ' 아이폰·아이패드에서는 영상 소리 크기가 기기 음량을 따라가요.' : ''}
+          </p>
         </div>
       </section>
+
+      {isYt && heard.length > 0 && (
+        <section className="stack-sm">
+          <h2 className="section-title">목소리 전체 타이밍</h2>
+          <div className="card sync-card">
+            <div className="sync-head">
+              <strong>이 기기에서만</strong>
+              <output>{audio.shift === 0 ? '그대로' : audio.shift > 0 ? `${audio.shift}ms 늦게` : `${-audio.shift}ms 빠르게`}</output>
+            </div>
+            <div className="sync-row">
+              <button className="icon-btn" onClick={() => audio.setShift(audio.shift - 10)} aria-label="목소리 전체 10ms 빠르게">
+                <Icon name="minus" />
+              </button>
+              <input id="yt-shift" type="range" min={-300} max={300} step={10} value={audio.shift} onChange={(e) => audio.setShift(Number(e.target.value))} aria-label="목소리 전체 타이밍" />
+              <button className="icon-btn" onClick={() => audio.setShift(audio.shift + 10)} aria-label="목소리 전체 10ms 늦게">
+                <Icon name="plus" />
+              </button>
+            </div>
+            <p className="hint">유튜브 영상과 목소리는 기기마다 소리가 나오는 빠르기가 조금 달라요. 모든 목소리가 한쪽으로 밀려 들리면 여기서 맞춰 주세요. 블루투스 이어폰을 쓰면 더 크게 어긋날 수 있어요.</p>
+            <Diagnose read={audio.diagnose} />
+          </div>
+        </section>
+      )}
 
       {editable.length > 0 && (
         <section className="stack-sm">
@@ -240,9 +270,15 @@ export function Mix({ code }: { code: string }) {
               <>
                 <button className="btn btn-primary btn-xl" onClick={exportMix} disabled={!heard.length}>
                   <Icon name="download" />
-                  {progress.allDone ? '완성본 파일 만들기' : '지금까지 합친 것 파일 만들기'}
+                  {isYt ? '목소리만 파일로 만들기' : progress.allDone ? '완성본 파일 만들기' : '지금까지 합친 것 파일 만들기'}
                 </button>
-                <p className="hint">{heard.length ? '지금 들리는 그대로 MP3 한 개로 만들어요.' : '녹음이 하나라도 있어야 만들 수 있어요.'}</p>
+                <p className="hint">
+                  {!heard.length
+                    ? '녹음이 하나라도 있어야 만들 수 있어요.'
+                    : isYt
+                      ? '유튜브 영상의 소리는 파일에 담을 수 없어서, 합친 목소리만 MP3 로 만들어요. 영상과 함께 남기고 싶으면 여기서 재생하면서 휴대폰의 화면 녹화를 켜 주세요.'
+                      : '지금 들리는 그대로 MP3 한 개로 만들어요.'}
+                </p>
               </>
             )}
           </div>
@@ -262,6 +298,25 @@ function Clock({ getPosition, active }: { getPosition: () => number; active: boo
     if (!active) setText(fmtTime(Math.max(0, getPosition())));
   }, [active, getPosition]);
   return <>{text}</>;
+}
+
+/** 싱크가 이상할 때 캡처해서 보낼 수 있는 진단 정보. 펼쳐 둔 동안만 1초마다 새로 읽는다. */
+function Diagnose({ read }: { read: () => string }) {
+  const [open, setOpen] = useState(false);
+  const [text, setText] = useState('');
+  useEffect(() => {
+    if (!open) return;
+    setText(read());
+    const timer = window.setInterval(() => setText(read()), 1000);
+    return () => window.clearInterval(timer);
+  }, [open, read]);
+  return (
+    <details className="diag" onToggle={(e) => setOpen((e.currentTarget as HTMLDetailsElement).open)}>
+      <summary>싱크가 계속 이상하면 (진단 정보)</summary>
+      <p>재생하는 동안 이 부분을 캡처해서 방을 만든 사람에게 보내 주세요.</p>
+      <pre>{text}</pre>
+    </details>
+  );
 }
 
 function MixRow({ label, color, value, max, onChange, id }: { label: string; color: string; value: number; max: number; onChange: (v: number) => void; id: string }) {

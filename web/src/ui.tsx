@@ -80,6 +80,25 @@ const paths: Record<string, ReactNode> = {
     </>
   ),
   tap: <path d="M9 11V5.5a1.75 1.75 0 013.5 0V11m0-1.5a1.75 1.75 0 013.5 0V12m0-.8a1.75 1.75 0 013.5 0V15a6 6 0 01-6 6h-1.6a6 6 0 01-4.7-2.3L4 14.5a1.7 1.7 0 012.6-2.2L9 14.5" />,
+  search: (
+    <>
+      <circle cx="11" cy="11" r="6.5" />
+      <path d="M16 16l4.5 4.5" />
+    </>
+  ),
+  video: (
+    <>
+      <rect x="3" y="5.5" width="18" height="13" rx="3.5" />
+      <path d="M10.2 9.2v5.6l4.8-2.8z" fill="currentColor" stroke="none" />
+    </>
+  ),
+  paste: (
+    <>
+      <rect x="5.5" y="5" width="13" height="16" rx="2.5" />
+      <path d="M9 5V4.2A1.2 1.2 0 0110.2 3h3.6A1.2 1.2 0 0115 4.2V5M9 11h6M9 15h4" />
+    </>
+  ),
+  out: <path d="M13 5h6v6M19 5l-8.5 8.5M10 6H7a2 2 0 00-2 2v9a2 2 0 002 2h9a2 2 0 002-2v-3" />,
 };
 
 export function Icon({ name, size = 22 }: { name: keyof typeof paths | string; size?: number }) {

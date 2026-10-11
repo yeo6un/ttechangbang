@@ -50,7 +50,6 @@ try {
   });
   await host.locator('#song-file').setInputFiles({ name: '우리 노래_최종.wav', mimeType: 'audio/wav', buffer: Buffer.from(wavB64, 'base64') });
   await host.getByRole('heading', { name: '부를 구간을 골라요' }).waitFor({ timeout: 20000 });
-  assert.equal(await host.locator('#room-title').inputValue(), '우리 노래 최종');
   await shot(host, '20-trim');
   await host.getByRole('button', { name: '전체' }).click();
   await host.getByRole('button', { name: '구간 듣기' }).click();
@@ -107,6 +106,8 @@ try {
   await host.getByRole('button', { name: '이대로' }).click();
   assert.equal(await host.locator('.line-row').first().locator('.all-chip').count(), 1);
   await host.getByText('블라인드 모드').click();
+  // 방 이름은 파일 이름에서 따 온다 (확장자·밑줄 정리)
+  assert.equal(await host.locator('#room-title').inputValue(), '우리 노래 최종');
   await host.getByLabel('내 이름').fill('서연');
   await shot(host, '25-parts');
   const open = host.getByRole('button', { name: '방 열고 번호 받기' });

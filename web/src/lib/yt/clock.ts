@@ -28,16 +28,32 @@ interface Sample {
   v: number;
 }
 
+/** 되짚어 볼 때 쓰려고 남겨 두는 표본의 수 (넘치면 오래된 것부터 버린다) */
+const HIST_MAX = 8000;
+
 /** 잡음 섞인 표본들에서 두 시계의 차이를 안정적으로 뽑아낸다. 값이 갑자기 옮겨 가면(탐색·버퍼링) 알아채고 새로 잡는다. */
 export class OffsetTracker {
   private samples: Sample[] = [];
   private strikes: Sample[] = [];
   private _value = NaN;
   private _locked = false;
+  /** 받은 표본 전부. 지나고 나서 "그때의 값"을 되짚어 볼 때 쓴다 (reset 으로는 지우지 않는다). */
+  private hist: Sample[] = [];
   /** 값이 옮겨 간 횟수 */
   jumps = 0;
 
-  constructor(private readonly o: TrackerOptions) {}
+  constructor(private o: TrackerOptions) {}
+
+  /** 표본의 성질이 바뀌면(정확한 시각 ↔ 늦게 도착하는 시각) 고르는 방법을 바꾸고 새로 모은다 */
+  setMode(mode: TrackerOptions['mode']): void {
+    if (this.o.mode === mode) return;
+    this.o = { ...this.o, mode };
+    this.hist = []; // 성질이 다른 표본을 한데 섞어 고르면 안 된다
+    this.reset();
+  }
+  get mode(): TrackerOptions['mode'] {
+    return this.o.mode;
+  }
 
   get locked(): boolean {
     return this._locked;
@@ -59,6 +75,8 @@ export class OffsetTracker {
   /** t: 표본을 얻은 시각(초), v: 그때의 차이값 */
   add(t: number, v: number): void {
     if (!Number.isFinite(t) || !Number.isFinite(v)) return;
+    this.hist.push({ t, v });
+    if (this.hist.length > HIST_MAX) this.hist.splice(0, HIST_MAX >> 2);
     if (this._locked) {
       if (Math.abs(v - this._value) > this.o.tol) {
         // 한 번 튄 값은 버린다. 튄 값끼리 서로 맞으면 시계가 정말 옮겨 간 것이다.
@@ -94,6 +112,16 @@ export class OffsetTracker {
     this._value = this.pick(this.samples);
   }
 
+  /**
+   * t0~t1 사이에 받은 표본만으로 고른 값. 표본이 min 개보다 적으면 null.
+   * 실시간 값(value)은 최근 몇 초의 표본에서 고르기 때문에, 값이 조금 옮겨 간 직후에는 한동안 예전 값을 따라간다.
+   * 지나고 나서 "그 줄을 부르던 때의 값"을 되짚어 볼 때는 이쪽이 맞다.
+   */
+  valueIn(t0: number, t1: number, min = 4): number | null {
+    const list = this.hist.filter((s) => s.t >= t0 && s.t <= t1);
+    return list.length >= min ? this.pick(list) : null;
+  }
+
   private pick(list: Sample[]): number {
     if (!list.length) return NaN;
     const vs = list.map((s) => s.v).sort((a, b) => a - b);
@@ -110,6 +138,8 @@ export class MediaClock {
   private _playing = false;
   /** 탐색 직후 잠깐은, 탐색 전 위치를 알리는 늦은 표본이 섞여 들어올 수 있다 */
   private expect: { media: number; perf: number } | null = null;
+  /** 마지막으로 "정확한 시각"이 달린 표본을 받은 때 (ms) */
+  private lastExact = -Infinity;
 
   get playing(): boolean {
     return this._playing;
@@ -123,9 +153,17 @@ export class MediaClock {
     this.tr.reset();
   }
 
-  /** media: 영상 위치(초), perfMs: 그 위치였던 순간 (performance.now 기준 ms) */
-  feed(media: number, perfMs: number): void {
+  /**
+   * media: 영상 위치(초), perfMs: 그 위치였던 순간 (performance.now 기준 ms).
+   * exact: 그 순간을 플레이어가 직접 알려 줬는지. 아니면 "알림이 도착한 시각"이라 실제보다 늦기만 하므로
+   * (늦은 만큼 차이값이 작게 나온다) 표본들 가운데 위쪽 값을 고른다.
+   */
+  feed(media: number, perfMs: number, exact = true): void {
     if (!Number.isFinite(media) || !Number.isFinite(perfMs)) return;
+    // 정확한 표본이 오고 있는 동안에는 어림 표본(직접 물어본 값 등)을 섞지 않는다. 둘을 번갈아 받으면 매번 새로 잡게 된다.
+    if (exact) this.lastExact = perfMs;
+    else if (perfMs - this.lastExact < 3000) return;
+    this.tr.setMode(exact ? 'median' : 'upper');
     if (this.expect) {
       const since = (perfMs - this.expect.perf) / 1000;
       if (since > 2) this.expect = null;
@@ -153,6 +191,15 @@ export class MediaClock {
     return this.tr.jumps;
   }
 
+  /**
+   * 벽시계 t0~t1(초) 사이에 받은 표본만으로 고른 D. 표본이 모자라면 null.
+   * 위치를 잰 시각을 모르는 표본(늦게만 도착한다)은 몇 개만으로는 믿기 어려워서 앞뒤를 넉넉히 넓혀서 고른다.
+   */
+  valueIn(t0: number, t1: number): number | null {
+    const pad = this.tr.mode === 'upper' ? 2.5 : 0.3;
+    return this.tr.valueIn(t0 - pad, t1 + pad, this.tr.mode === 'upper' ? 8 : 4);
+  }
+
   /** 그 순간 귀에 들리는 영상 위치 */
   mediaAt(perfMs: number): number {
     if (this.locked) return perfMs / 1000 + this.tr.value;
@@ -172,7 +219,8 @@ export interface AudioClockSource {
 
 /** 소리 시계: 우리 AudioContext 의 몇 초가 지금 귀에 들리고 있는지(A)를 잡는다 */
 export class AudioWallClock {
-  private stamp = new OffsetTracker({ tol: 0.03, minSamples: 4, minSpan: 0.15, window: 6, mode: 'median' });
+  // 창을 짧게 잡는다: 소리 처리가 한 번 밀리면(기기가 바쁠 때 흔하다) 값이 그만큼 옮겨 가는데, 창이 길면 한참 뒤에야 따라간다
+  private stamp = new OffsetTracker({ tol: 0.03, minSamples: 4, minSpan: 0.15, window: 3, mode: 'median' });
   private stairs = new OffsetTracker({ tol: 0.09, minSamples: 6, minSpan: 0.25, window: 3, mode: 'upper' });
   private stampFails = 0;
 
@@ -223,6 +271,10 @@ export class AudioWallClock {
   get offset(): number {
     return this.best.value;
   }
+  /** 벽시계 t0~t1(초) 사이에 받은 표본만으로 고른 A. 표본이 모자라면 null. */
+  valueIn(t0: number, t1: number): number | null {
+    return this.best.valueIn(t0, t1, 5);
+  }
   /** 처리 위치가 귀에 들리는 위치보다 얼마나 앞서 있는지 (재생 지연의 추정값) */
   ahead(perfMs: number = performance.now()): number {
     if (!this.locked) return this.reported();
@@ -243,6 +295,15 @@ export interface ZeroLog {
   pos: number;
   /** 그때 잰 tZero */
   k: number;
+  /** 그때의 벽시계(초). 있으면 줄별 값을 되짚어 고를 때 쓴다. */
+  at?: number;
+}
+
+/** 되짚어 보기용: 어떤 시간 폭(벽시계 초)에 받은 표본만으로 고른 두 시계의 값 */
+export interface RawClocks {
+  segStart: number;
+  media(t0: number, t1: number): number | null;
+  audio(t0: number, t1: number): number | null;
 }
 
 export interface ZeroFit {
@@ -260,4 +321,51 @@ export function fitZero(log: ZeroLog[], t0: number, t1: number): ZeroFit | null 
   const ks = use.map((e) => e.k).sort((a, b) => a - b);
   const at = (q: number) => ks[Math.min(ks.length - 1, Math.max(0, Math.round(q * (ks.length - 1))))];
   return { tZero: at(0.5), spread: at(0.95) - at(0.05), n: ks.length };
+}
+
+export interface ZeroLines {
+  /** 부른 구간 전체의 대푯값 */
+  overall: ZeroFit;
+  /** 줄마다 쓸 tZero (줄 순서대로) */
+  lines: number[];
+  /** 한 줄 안에서 값이 흩어진 정도 가운데 가장 큰 것(초). 크면 부르는 도중에 끊긴 것이다. */
+  spread: number;
+}
+
+/** 줄별 값이 전체 대푯값과 이만큼도 차이 나지 않으면 같은 값으로 본다 (재는 오차로 생기는 잔떨림을 따라가지 않으려고) */
+const STEP_MIN = 0.006;
+
+/**
+ * 줄마다 tZero 를 따로 고른다.
+ * 녹음 도중에 소리 처리가 잠깐 밀리거나(기기가 바쁠 때) 영상이 멈칫하면 두 시계의 차이가 그 순간부터 달라진다.
+ * 한 값으로 전체를 자르면 그 뒤(또는 앞)의 줄이 통째로 어긋나므로, 각 줄은 그 줄을 부르던 때의 값으로 맞춘다.
+ *
+ * raw 를 주면 줄별 값을 "그 줄을 부르던 동안에 받은 표본"만으로 다시 고른다. 기록(log)에 적힌 값은 실시간으로 쓰던 값이라
+ * 옮겨 간 뒤 한동안은 예전 값이 적혀 있다 (최근 몇 초의 표본에서 고르기 때문에). 되짚어 고르면 그 늦음이 없다.
+ */
+export function fitZeroLines(log: ZeroLog[], windows: [number, number][], raw?: RawClocks): ZeroLines | null {
+  if (!windows.length) return null;
+  const overall = fitZero(log, Math.min(...windows.map((w) => w[0])), Math.max(...windows.map((w) => w[1])));
+  if (!overall) return null;
+  let spread = 0;
+  const lines = windows.map(([a, b]) => {
+    const use = log.filter((e) => e.pos >= a - 0.4 && e.pos <= b + 0.3 && Number.isFinite(e.k));
+    if (use.length < 3) return overall.tZero;
+    const ks = use.map((e) => e.k).sort((x, y) => x - y);
+    const at = (q: number) => ks[Math.min(ks.length - 1, Math.max(0, Math.round(q * (ks.length - 1))))];
+    spread = Math.max(spread, at(0.9) - at(0.1));
+    let mid = at(0.5);
+    if (raw) {
+      const walls = use.map((e) => e.at).filter((t): t is number => typeof t === 'number' && Number.isFinite(t));
+      if (walls.length >= 3) {
+        const w0 = Math.min(...walls);
+        const w1 = Math.max(...walls);
+        const d = raw.media(w0, w1);
+        const au = raw.audio(w0, w1);
+        if (d !== null && au !== null) mid = tZeroOf(raw.segStart, d, au);
+      }
+    }
+    return Math.abs(mid - overall.tZero) < STEP_MIN ? overall.tZero : mid;
+  });
+  return { overall, lines, spread };
 }

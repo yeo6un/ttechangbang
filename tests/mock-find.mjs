@@ -11,7 +11,10 @@ const stamp = (t) => `[${String(Math.floor(t / 60)).padStart(2, '0')}:${(t % 60)
 const SYNCED = DEMO_TEXTS.map((text, i) => `${stamp((1 + i) * BAR)} ${text}`).join('\n');
 const PLAIN = DEMO_TEXTS.join('\n');
 
+const ROMAN = ['hana dul set sijakhae', 'moksorireul gyeopchyeo bwa', 'teullyeodo geunyang useo', 'bakjaneun daechung gado', 'yeogineun naega halge', 'daeumeun nega bada', 'da gachi keuge jilleo bwa', 'ttechangbangeseo manna'];
 const LRC = [
+  // 같은 곡의 로마자 표기판 (먼저 나오지만, 한글판이 있으면 한글판을 골라야 한다)
+  { id: 500, trackName: 'Practice Song', artistName: 'Ttechang Band', albumName: 'Ttechang Vol.1 (Romanized)', duration: 24.0, instrumental: false, plainLyrics: ROMAN.join('\n'), syncedLyrics: ROMAN.map((text, i) => `${stamp((1 + i) * BAR)} ${text}`).join('\n') },
   { id: 501, trackName: 'Practice Song', artistName: 'Ttechang Band', albumName: 'Ttechang Vol.1', duration: 24.0, instrumental: false, plainLyrics: PLAIN, syncedLyrics: SYNCED },
   { id: 502, trackName: 'Practice Song', artistName: 'Ttechang Band', albumName: 'Ttechang Live', duration: 61.0, instrumental: false, plainLyrics: PLAIN, syncedLyrics: null },
   { id: 503, trackName: 'Untimed Song', artistName: 'Ttechang Band', albumName: 'Ttechang Vol.2', duration: 24.0, instrumental: false, plainLyrics: PLAIN, syncedLyrics: null },

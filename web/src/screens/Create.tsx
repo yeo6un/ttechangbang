@@ -1,6 +1,6 @@
-// 방 만들기 마법사: 노래 고르기 → 구간 고르기 → 가사·타이밍 → 파트 나누기 → 방 번호 받기
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { api, ApiError, type Identity } from '../lib/api';
+// 방 만들기 마법사: 노래 찾기 → 반주(유튜브 영상 또는 파일) → 부를 구간 → 가사·타이밍 → 파트 나누기 → 방 번호 받기
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { api, ApiError, type FoundSong, type FoundVideo, type Identity } from '../lib/api';
 import { bestWindow, detectTempo, normalizeBacking } from '../lib/audio/analysis';
 import { decodeFile, encodeWithLead } from '../lib/audio/codec';
 import { getCtx, unlockAudio } from '../lib/audio/context';
@@ -9,25 +9,32 @@ import { mixToMono } from '../lib/audio/dsp';
 import { seedAudio } from '../lib/audio/library';
 import { LEAD_SEC } from '../lib/audio/marker';
 import { bytesToBase64, computePeaks } from '../lib/audio/peaks';
-import { Transport } from '../lib/audio/transport';
-import { alignWords, evenStarts, linesFromSegments, linesFromStarts, parseLyrics } from '../lib/lyrics';
+import { Transport, type Deck } from '../lib/audio/transport';
+import { guessFromVideoTitle, loadLyrics, loadVideo, searchSongs, type SongSearch } from '../lib/find';
+import { alignWords, evenStarts, linesFromSegments, linesFromStarts, parseLyrics, parseSynced, shiftLines, type RangePick } from '../lib/lyrics';
 import { autoAssign, blankLines, fmtTime, newLineId, type Line } from '../lib/parts';
 import { fmtCode, navigate, roomLink } from '../lib/router';
 import { store } from '../lib/store';
-import { copyText, Icon, Spinner, Toggle, TopBar, useRaf, useToast } from '../ui';
+import { YtDeck } from '../lib/yt/deck';
+import { parseYtId, ytThumb } from '../lib/yt/ids';
+import { useYtPlayer, YtFrame, YtTapNote } from '../lib/yt/useYt';
+import { copyText, Icon, Toggle, TopBar, useToast } from '../ui';
+import { PreviewButton, TrimBox, type Source } from './create/FileTrim';
+import { RangeLines, type LineRange } from './create/RangeLines';
+import { RangeTime } from './create/RangeTime';
+import { SongFinder } from './create/SongFinder';
+import { SourcePicker, type LyrState } from './create/SourcePicker';
+import { TapSync } from './create/TapSync';
+import { lookUpVideo, type VideoPick } from './create/YtLinkInput';
 import { PartsEditor } from './PartsEditor';
 
-type Step = 'song' | 'trim' | 'lyrics' | 'timing' | 'tap' | 'parts' | 'done';
-const STEP_ORDER: Step[] = ['song', 'trim', 'lyrics', 'timing', 'parts', 'done'];
+type Step = 'song' | 'source' | 'trim' | 'range' | 'lyrics' | 'timing' | 'tap' | 'parts' | 'done';
+/** 반주를 무엇으로 쓰는지 */
+type Mode = 'yt' | 'file' | 'demo';
+/** 위쪽 진행 막대의 다섯 칸 가운데 몇 번째인지 */
+const STEP_INDEX: Record<Step, number> = { song: 0, source: 0, trim: 1, range: 1, lyrics: 2, timing: 3, tap: 3, parts: 4, done: 5 };
 const LENGTHS = [30, 45, 60, 90];
 const MAX_LEN = 120;
-
-interface Source {
-  buffer: AudioBuffer;
-  name: string;
-  demo: boolean;
-  peaks: Uint8Array;
-}
 
 interface Segment {
   buffer: AudioBuffer;
@@ -63,12 +70,42 @@ const cleanTitle = (name: string) => name.replace(/\.[a-z0-9]{2,5}$/i, '').repla
 export function Create() {
   const toast = useToast();
   const [step, setStep] = useState<Step>('song');
+  const [mode, setMode] = useState<Mode>('yt');
+  const [cfg, setCfg] = useState({ ai: false, ytSearch: false, ytSeconds: 330 });
   const [opening, setOpening] = useState(false);
+
+  // 곡 찾기
+  const [q, setQ] = useState('');
+  const [searching, setSearching] = useState(false);
+  const [search, setSearch] = useState<SongSearch | null>(null);
+  const [song, setSong] = useState<FoundSong | null>(null);
+  const [lyr, setLyr] = useState<Omit<LyrState, 'syncedLines'>>({ state: 'idle', data: null });
+  const [cand, setCand] = useState<{ q: string; busy: boolean; search: SongSearch | null }>({ q: '', busy: false, search: null });
+  const findRun = useRef(0);
+
+  // 유튜브 반주
+  const [video, setVideo] = useState<VideoPick | null>(null);
+  const [alts, setAlts] = useState<FoundVideo[]>([]);
+  const [finding, setFinding] = useState(false);
+  const [seg, setSeg] = useState<{ start: number; dur: number } | null>(null);
+  const [lineRange, setLineRange] = useState<LineRange | null>(null);
+  const [ytTap, setYtTap] = useState(false);
+  const [checking, setChecking] = useState(false);
+  /** 실제로 재생되는 것을 확인한 영상 */
+  const playable = useRef('');
+  const ytDeckRef = useRef<YtDeck | null>(null);
+  const draftKey = useRef('');
+
+  // 파일 반주
   const [source, setSource] = useState<Source | null>(null);
   const [loadingFile, setLoadingFile] = useState('');
   const [sel, setSel] = useState({ start: 0, len: 45 });
-  const [title, setTitle] = useState('');
   const [segment, setSegment] = useState<Segment | null>(null);
+  const [fileFrom, setFileFrom] = useState<'song' | 'source'>('song');
+
+  // 공통
+  const [title, setTitle] = useState('');
+  const titleTouched = useRef(false);
   const [upload, setUpload] = useState<Upload>({ state: 'idle' });
   const [draft, setDraft] = useState<{ code: string; who: Identity } | null>(null);
   const [lyrics, setLyrics] = useState('');
@@ -76,20 +113,41 @@ export function Create() {
   const [timed, setTimed] = useState<Line[] | null>(null);
   const [timingNote, setTimingNote] = useState('');
   const [parts, setParts] = useState<Line[]>([]);
+  const [partsFrom, setPartsFrom] = useState<Step>('timing');
   const [seatCount, setSeatCount] = useState(4);
   const [blind, setBlind] = useState(false);
   const [hostName, setHostName] = useState(() => store.name());
-  const [aiOn, setAiOn] = useState(false);
   const [aiBusy, setAiBusy] = useState(false);
   const [copied, setCopied] = useState('');
   const runId = useRef(0);
   const transportRef = useRef<Transport | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
+  // 영상은 반주를 고르는 단계부터 타이밍을 맞추는 단계까지 같은 자리에 둔다
+  const showYt = mode === 'yt' && !!video && (step === 'source' || step === 'range' || step === 'lyrics' || step === 'timing' || step === 'tap');
+  const yt = useYtPlayer(showYt ? video!.id : null, true);
+  const sync = useMemo(() => (lyr.data?.synced ? parseSynced(lyr.data.synced) : []), [lyr.data]);
+  const hasSync = sync.length >= 2;
+  const dur = mode === 'yt' ? (seg?.dur ?? 0) : (segment?.buffer.duration ?? 0);
+  const aiOn = cfg.ai;
+
   useEffect(() => {
-    api.config().then((c) => setAiOn(c.ai)).catch(() => {});
+    api
+      .config()
+      .then((c) => setCfg({ ai: c.ai, ytSearch: !!c.ytSearch, ytSeconds: c.limits.ytSeconds || 330 }))
+      .catch(() => {});
     return () => transportRef.current?.dispose();
   }, []);
+
+  // 영상 플레이어가 바뀌거나 사라지면 거기에 물려 둔 재생기도 정리한다
+  useEffect(
+    () => () => {
+      ytDeckRef.current?.dispose();
+      ytDeckRef.current = null;
+      setYtTap(false);
+    },
+    [yt.player],
+  );
 
   const transport = useCallback(async () => {
     const ctx = await unlockAudio();
@@ -97,13 +155,238 @@ export function Create() {
     return transportRef.current;
   }, []);
 
-  const stopAudio = () => transportRef.current?.stop();
+  /** 유튜브 반주용 재생기. 사용자가 누른 그 순간에 불러야 소리가 허락된다. */
+  const ytDeck = (): YtDeck | null => {
+    const p = yt.player;
+    if (!p || !seg) return null;
+    const ctx = getCtx();
+    if (ctx.state !== 'running') void ctx.resume().catch(() => {});
+    const cur = ytDeckRef.current;
+    if (!cur || cur.yt !== p || cur.ctx !== ctx || cur.seg.start !== seg.start || cur.seg.dur !== seg.dur) {
+      cur?.dispose();
+      const d = new YtDeck(ctx, p, seg);
+      d.setMix({ backing: 0.8, seats: {}, echo: 0 });
+      d.on((e) => {
+        if (e.type === 'needTap') setYtTap(e.on);
+        else if (e.type === 'failed') toast(e.error.message, 'error');
+      });
+      ytDeckRef.current = d;
+    }
+    return ytDeckRef.current;
+  };
 
-  // ───────── 1. 노래 ─────────
+  /** 지금 반주(파일이든 영상이든)를 트는 재생기 */
+  const getDeck = async (): Promise<Deck> => {
+    if (mode === 'yt') {
+      const d = ytDeck();
+      if (!d) throw new Error('영상이 아직 준비되지 않았어요.');
+      return d;
+    }
+    const t = await transport();
+    t.setSong(segment?.buffer ?? null);
+    t.setTakes([]);
+    return t;
+  };
+
+  const stopAudio = () => {
+    transportRef.current?.stop();
+    ytDeckRef.current?.stop();
+    yt.player?.pause();
+  };
+
+  // ───────── 1. 곡 찾기 ─────────
+  const runSearch = async () => {
+    const text = q.trim();
+    if (text.length < 2 || searching) return;
+    // 검색 칸에 유튜브 링크를 넣은 경우에는 링크로 시작한다
+    if (parseYtId(text) && /youtu/i.test(text)) return void startFromLink(text);
+    setSearching(true);
+    try {
+      setSearch(await searchSongs(text, cfg.ai));
+    } catch {
+      setSearch({ songs: [], down: true });
+    } finally {
+      setSearching(false);
+    }
+  };
+
+  const resetWork = () => {
+    setSeg(null);
+    setLineRange(null);
+    setTimed(null);
+    setTexts([]);
+    setLyrics('');
+    setTimingNote('');
+  };
+
+  const pickSong = (s: FoundSong, keepVideo = false) => {
+    const id = ++findRun.current;
+    setSong(s);
+    if (!titleTouched.current) setTitle(s.title.slice(0, 60));
+    setLyr({ state: 'loading', data: null });
+    resetWork();
+    loadLyrics(s).then(
+      (data) => findRun.current === id && setLyr({ state: 'done', data }),
+      () => findRun.current === id && setLyr({ state: 'done', data: { found: false } }),
+    );
+    if (!keepVideo) {
+      setVideo(null);
+      setAlts([]);
+      setFinding(false);
+      if (cfg.ytSearch) {
+        setFinding(true);
+        loadVideo(s)
+          .then((r) => {
+            if (findRun.current !== id || !r) return;
+            setVideo(r.video);
+            setAlts(r.alts);
+          })
+          .catch(() => {})
+          .finally(() => findRun.current === id && setFinding(false));
+      }
+    }
+    setMode('yt');
+    setStep('source');
+  };
+
+  const pickVideo = (v: VideoPick | null) => {
+    stopAudio();
+    const prev = video;
+    setVideo(v);
+    setSeg(null);
+    setLineRange(null);
+    // 바꾸기 전 영상은 "다른 영상" 목록에 남겨 둔다
+    if (v) setAlts((cur) => [...(prev && prev.id !== v.id ? [{ ...prev, thumb: ytThumb(prev.id) }] : []), ...cur.filter((a) => a.id !== v.id && a.id !== prev?.id)].slice(0, 5));
+  };
+
+  const runCandSearch = async (text: string) => {
+    if (text.trim().length < 2) return;
+    setCand((c) => ({ ...c, busy: true }));
+    try {
+      const out = await searchSongs(text.trim(), cfg.ai);
+      setCand((c) => ({ ...c, busy: false, search: out }));
+    } catch {
+      setCand((c) => ({ ...c, busy: false, search: { songs: [], down: true } }));
+    }
+  };
+
+  /** 링크로 시작: 영상부터 정하고, 영상 제목으로 가사를 찾아본다 */
+  const startWithVideo = (v: VideoPick) => {
+    ++findRun.current;
+    setSong(null);
+    setLyr({ state: 'idle', data: null });
+    setAlts([]);
+    setFinding(false);
+    setVideo(v);
+    resetWork();
+    const guess = guessFromVideoTitle(v.title, v.author);
+    if (!titleTouched.current) setTitle(guess.slice(0, 60));
+    setCand({ q: guess, busy: false, search: null });
+    if (guess.length >= 2) void runCandSearch(guess);
+    setMode('yt');
+    setStep('source');
+  };
+
+  const startFromLink = async (text: string) => {
+    try {
+      startWithVideo(await lookUpVideo(text));
+    } catch (e) {
+      toast((e as Error).message, 'error');
+    }
+  };
+
+  // 다른 앱(유튜브)의 "공유"로 넘어온 주소가 있으면 그 영상으로 바로 시작한다
+  useEffect(() => {
+    const p = new URLSearchParams(location.search);
+    const shared = [p.get('url'), p.get('text'), p.get('title')].find((x) => x && parseYtId(x));
+    if (shared) void startFromLink(shared);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ───────── 2-가. 유튜브 영상으로 ─────────
+  /**
+   * 구간을 고르러 가기 전에 영상을 잠깐 틀어 본다. 올린 사람이 다른 사이트에서의 재생을 막아 둔 영상은
+   * 틀어 봐야 알 수 있어서, 방을 다 만든 뒤에야 "재생이 안 돼요"가 되는 일을 막으려는 것이다.
+   */
+  const sourceNext = async () => {
+    const p = yt.player;
+    if (!p || !video || checking) return;
+    if (playable.current === video.id) return setStep('range');
+    setChecking(true);
+    try {
+      await p.confirmPlayable(setYtTap);
+      p.pause();
+      playable.current = video.id;
+      setStep('range');
+    } catch (e) {
+      toast(e instanceof Error ? e.message : '영상을 재생하지 못했어요. 다른 영상을 골라 주세요.', 'error');
+    } finally {
+      setChecking(false);
+      setYtTap(false);
+    }
+  };
+
+  const prepareYt = async (s: { start: number; dur: number }) => {
+    if (!video) return;
+    const len = Math.round(yt.player?.duration || video.len || 0);
+    const key = `${video.id}:${s.start}:${s.dur}`;
+    if (draftKey.current === key && draft) return;
+    const id = ++runId.current;
+    draftKey.current = '';
+    setDraft(null);
+    setUpload({ state: 'working', label: '방을 준비하는 중', progress: 0.5 });
+    try {
+      const created = await api.createRoom({
+        title: title.trim() || '이름 없는 방',
+        hostName: store.name() || '방장',
+        seatCount,
+        song: { dur: s.dur, lead: 0, peaks: '', name: song?.title || video.title, artist: song?.artist || '', bpm: 0, beat0: 0, demo: false, yt: { id: video.id, start: s.start, len, title: video.title, author: video.author } },
+      });
+      if (runId.current !== id) return;
+      store.setIdentity(created.code, created.member);
+      draftKey.current = key;
+      setDraft({ code: created.code, who: created.member });
+      setUpload({ state: 'ready' });
+    } catch (e) {
+      if (runId.current !== id) return;
+      setUpload({ state: 'failed', message: e instanceof ApiError ? e.message : '방을 준비하지 못했어요.' });
+    }
+  };
+
+  const confirmLines = (pick: RangePick, range: LineRange) => {
+    stopAudio();
+    const s = { start: pick.start, dur: pick.dur };
+    setLineRange(range);
+    setSeg(s);
+    setTexts(pick.lines.map((l) => l.text));
+    setTimed(pick.lines);
+    setTimingNote('');
+    setParts(autoAssign(pick.lines, seatCount, 'smart'));
+    setPartsFrom('range');
+    setStep('parts');
+    void prepareYt(s);
+  };
+
+  const confirmTime = (s: { start: number; dur: number }) => {
+    stopAudio();
+    setSeg(s);
+    setTimed(null);
+    if (!lyrics.trim() && lyr.data?.plain) setLyrics(lyr.data.plain);
+    setStep('lyrics');
+    void prepareYt(s);
+  };
+
+  // ───────── 2-나. 노래 파일로 ─────────
+  const chooseFile = (from: 'song' | 'source') => {
+    setFileFrom(from);
+    fileRef.current?.click();
+  };
+
   const openFile = async (file: File) => {
     if (file.size > 200 * 1024 * 1024) return toast('파일이 너무 커요. 200MB 이하 파일로 해 주세요.', 'error');
     setLoadingFile(file.name);
     try {
+      stopAudio();
       await unlockAudio();
       const buffer = await decodeFile(file, getCtx());
       if (buffer.duration < 8) throw new Error('short');
@@ -111,7 +394,16 @@ export function Create() {
       const len = Math.min(45, Math.floor(buffer.duration));
       setSource({ buffer, name: file.name, demo: false, peaks: computePeaks(mono, 900) });
       setSel({ start: Math.min(bestWindow(mono, buffer.sampleRate, len), Math.max(0, buffer.duration - len)), len });
-      setTitle(cleanTitle(file.name));
+      // 곡을 찾아 둔 상태가 아니면 파일 이름을 방 이름으로 쓴다
+      if (!titleTouched.current && !(fileFrom === 'source' && song)) setTitle(cleanTitle(file.name));
+      if (fileFrom === 'song') {
+        ++findRun.current;
+        setSong(null);
+        setLyr({ state: 'idle', data: null });
+        setLyrics('');
+      }
+      setTimed(null);
+      setMode('file');
       setStep('trim');
     } catch (e) {
       toast((e as Error).message === 'short' ? '8초보다 긴 노래 파일을 골라 주세요.' : '이 파일은 열 수 없어요. mp3, m4a, wav 같은 음악 파일이나 화면 녹화 영상으로 다시 해 주세요.', 'error');
@@ -131,22 +423,26 @@ export function Create() {
     const peaks = computePeaks(mixToMono([left, right]), 400);
     setSource({ buffer, name: '연습용 비트', demo: true, peaks });
     setTitle('연습용 비트');
-    const seg: Segment = { buffer, peaks: bytesToBase64(peaks), bpm: DEMO_BPM, beat0: 0 };
-    setSegment(seg);
+    const s: Segment = { buffer, peaks: bytesToBase64(peaks), bpm: DEMO_BPM, beat0: 0 };
+    setSegment(s);
     const lines = DEMO_LINES.map((l) => ({ ...l, id: newLineId(), seats: [] as number[] }));
+    setTexts(lines.map((l) => l.text));
     setTimed(lines);
     setParts(autoAssign(lines, seatCount, 'smart'));
+    setMode('demo');
+    setPartsFrom('song');
     setStep('parts');
-    void prepare(seg, '연습용 비트', '연습용 비트', true);
+    void prepare(s, '연습용 비트', '연습용 비트', true);
   };
 
-  // ───────── 2. 구간 → 뒤에서 올리기 시작 ─────────
-  const prepare = async (seg: Segment, roomTitle: string, fileName: string, demo: boolean) => {
+  /** 고른 구간을 작게 줄여 방에 올린다 (화면은 다음 단계로 먼저 넘어간다) */
+  const prepare = async (s: Segment, roomTitle: string, fileName: string, demo: boolean) => {
     const id = ++runId.current;
+    draftKey.current = '';
     setDraft(null);
     setUpload({ state: 'working', label: '노래를 작게 줄이는 중', progress: 0 });
     try {
-      const bytes = await encodeWithLead(bufferChannels(seg.buffer), seg.buffer.sampleRate, 4, (p) => {
+      const bytes = await encodeWithLead(bufferChannels(s.buffer), s.buffer.sampleRate, 4, (p) => {
         if (runId.current === id) setUpload({ state: 'working', label: '노래를 작게 줄이는 중', progress: p * 0.7 });
       });
       if (runId.current !== id) return;
@@ -155,13 +451,13 @@ export function Create() {
         title: roomTitle || '이름 없는 방',
         hostName: store.name() || '방장',
         seatCount,
-        song: { dur: seg.buffer.duration, lead: LEAD_SEC, peaks: seg.peaks, name: fileName, bpm: seg.bpm, beat0: seg.beat0, demo },
+        song: { dur: s.buffer.duration, lead: LEAD_SEC, peaks: s.peaks, name: fileName, artist: demo ? '' : song?.artist || '', bpm: s.bpm, beat0: s.beat0, demo },
       });
       if (runId.current !== id) return;
       store.setIdentity(created.code, created.member);
       const room = await api.putSong(created.code, created.member, bytes);
       if (runId.current !== id) return;
-      if (room.song.blob) seedAudio(room.song.blob, seg.buffer);
+      if (room.song.blob) seedAudio(room.song.blob, s.buffer);
       setDraft({ code: created.code, who: created.member });
       setUpload({ state: 'ready' });
     } catch (e) {
@@ -177,22 +473,32 @@ export function Create() {
     const mono = mixToMono(bufferChannels(buffer));
     const tempo = detectTempo(mono, buffer.sampleRate);
     const ok = tempo.confidence > 1.6;
-    const seg: Segment = { buffer, peaks: bytesToBase64(computePeaks(mono, 400)), bpm: ok ? tempo.bpm : 0, beat0: ok ? tempo.beat0 : 0 };
-    setSegment(seg);
+    const s: Segment = { buffer, peaks: bytesToBase64(computePeaks(mono, 400)), bpm: ok ? tempo.bpm : 0, beat0: ok ? tempo.beat0 : 0 };
+    setSegment(s);
     setTimed(null);
+    if (!lyrics.trim() && lyr.data?.plain) setLyrics(lyr.data.plain);
     setStep('lyrics');
-    void prepare(seg, title.trim(), source.name, false);
+    void prepare(s, title.trim(), source.name, false);
+  };
+
+  const retryPrepare = () => {
+    if (mode === 'yt') {
+      if (seg) void prepareYt(seg);
+    } else if (segment && source) {
+      void prepare(segment, title.trim(), source.name, source.demo);
+    }
   };
 
   // ───────── 3. 가사 ─────────
-  const dur = segment?.buffer.duration ?? 0;
+  /** 구간이 원곡(영상·파일)의 어디에서 시작하는지 */
+  const origin = mode === 'yt' ? (seg?.start ?? 0) : sel.start;
 
   const lyricsNext = () => {
     const parsed = parseLyrics(lyrics);
     if (!parsed.texts.length) return toast('가사를 한 줄 이상 넣어 주세요. 가사가 없으면 아래 "가사 없이 진행"을 눌러 주세요.', 'error');
     setTexts(parsed.texts);
     if (parsed.times) {
-      const lines = linesFromStarts(parsed.texts, parsed.times.map((t) => t - sel.start), dur).filter((l) => l.t0 >= 0);
+      const lines = linesFromStarts(parsed.texts, parsed.times.map((t) => t - origin), dur).filter((l) => l.t0 >= 0);
       if (lines.length) {
         setTimed(lines);
         setTimingNote('가사에 들어 있던 시간표로 타이밍을 맞췄어요. 어긋난 줄만 고쳐 주세요.');
@@ -204,12 +510,28 @@ export function Create() {
     setStep('timing');
   };
 
+  /** 파일 반주: 찾아 둔 가사의 시간표를 그대로 쓴다 (올린 파일이 음원과 같다고 보고) */
+  const useFoundSynced = () => {
+    const inRange = sync.filter((l) => l.t >= origin - 0.3 && l.t < origin + dur - 0.5);
+    if (!inRange.length) return toast('고른 구간에 해당하는 가사 줄이 없어요. 가사를 직접 넣어 주세요.', 'error');
+    const lines = linesFromStarts(
+      inRange.map((l) => l.text),
+      inRange.map((l) => Math.max(0, l.t - origin)),
+      dur,
+    );
+    setTexts(lines.map((l) => l.text));
+    setLyrics(lines.map((l) => l.text).join('\n'));
+    setTimed(lines);
+    setTimingNote('찾아온 가사의 시간표로 맞췄어요. 줄마다 ▶ 로 들어 보고, 전체가 밀려 있으면 "가사 전체" 버튼으로 한꺼번에 옮겨 주세요.');
+    setStep('timing');
+  };
+
   const skipLyrics = () => {
-    if (!segment) return;
-    const lines = blankLines(dur, segment.bpm, segment.beat0);
+    const lines = blankLines(dur, segment?.bpm ?? 0, segment?.beat0 ?? 0);
     setTexts([]);
     setTimed(lines);
     setParts(autoAssign(lines, seatCount, 'smart'));
+    setPartsFrom('lyrics');
     setStep('parts');
   };
 
@@ -269,18 +591,22 @@ export function Create() {
     });
   };
 
+  const shiftAll = (delta: number) => setTimed((cur) => (cur ? shiftLines(cur, delta, dur) : cur));
+
   const playLine = async (line: Line) => {
-    if (!segment) return;
-    const t = await transport();
-    t.setSong(segment.buffer);
-    t.setTakes([]);
-    t.play(Math.max(0, line.t0 - 0.6), { until: Math.min(dur, line.t1 + 0.2), withTakes: false });
+    try {
+      const d = await getDeck();
+      void Promise.resolve(d.play(Math.max(0, line.t0 - 0.6), { until: Math.min(dur, line.t1 + 0.2), withTakes: false })).catch(() => {});
+    } catch (e) {
+      toast((e as Error).message, 'error');
+    }
   };
 
   const timingNext = () => {
     if (!timed?.length) return;
     stopAudio();
     setParts(autoAssign(timed, seatCount, 'smart'));
+    setPartsFrom('timing');
     setStep('parts');
   };
 
@@ -307,15 +633,29 @@ export function Create() {
 
   const back = () => {
     stopAudio();
-    if (step === 'song') return navigate('/');
-    if (step === 'done') return navigate('/');
-    if (step === 'tap') return setStep('timing');
-    if (step === 'parts' && (source?.demo || !texts.length)) return setStep(source?.demo ? 'song' : 'lyrics');
-    setStep(STEP_ORDER[Math.max(0, STEP_ORDER.indexOf(step) - 1)]);
+    switch (step) {
+      case 'song':
+      case 'done':
+        return navigate('/');
+      case 'source':
+        return setStep('song');
+      case 'trim':
+        return setStep(fileFrom === 'source' && (song || video) ? 'source' : 'song');
+      case 'range':
+        return setStep('source');
+      case 'lyrics':
+        return setStep(mode === 'yt' ? 'range' : 'trim');
+      case 'timing':
+        return setStep('lyrics');
+      case 'tap':
+        return setStep('timing');
+      case 'parts':
+        return setStep(partsFrom);
+    }
   };
 
-  const stepIndex = STEP_ORDER.indexOf(step === 'tap' ? 'timing' : step);
   const shareText = draft ? `떼창방에서 같이 불러요! "${title || '이름 없는 방'}"\n방 번호 ${fmtCode(draft.code)}\n${roomLink(draft.code)}` : '';
+  const videoLen = yt.player?.duration || video?.len || 0;
 
   return (
     <main className="page create">
@@ -324,42 +664,53 @@ export function Create() {
         title={step === 'done' ? '' : '방 만들기'}
         right={
           step !== 'done' && step !== 'song' ? (
-            <ol className="steps" aria-label={`5단계 중 ${stepIndex + 1}단계`}>
-              {STEP_ORDER.slice(0, 5).map((s, i) => (
-                <li key={s} className={i <= stepIndex ? 'is-on' : ''} />
+            <ol className="steps" aria-label={`5단계 중 ${STEP_INDEX[step] + 1}단계`}>
+              {[0, 1, 2, 3, 4].map((i) => (
+                <li key={i} className={i <= STEP_INDEX[step] ? 'is-on' : ''} />
               ))}
             </ol>
           ) : null
         }
       />
+      <input ref={fileRef} id="song-file" type="file" accept="audio/*,video/mp4,video/quicktime,video/webm,.mp3,.m4a,.wav,.aac,.flac,.ogg,.opus" hidden onChange={(e) => e.target.files?.[0] && openFile(e.target.files[0])} />
+
+      {showYt && <YtFrame yt={yt} className={step === 'range' ? 'is-sticky' : ''} note={ytTap ? <YtTapNote /> : null} />}
 
       {step === 'song' && (
-        <section className="stack">
-          <h1 className="title">어떤 노래를 부를까요?</h1>
-          <p className="lead">휴대폰이나 컴퓨터에 있는 노래 파일을 골라 주세요. 반주만 있는 파일(MR)도 좋아요.</p>
-          <input ref={fileRef} id="song-file" type="file" accept="audio/*,video/mp4,video/quicktime,video/webm,.mp3,.m4a,.wav,.aac,.flac,.ogg,.opus" hidden onChange={(e) => e.target.files?.[0] && openFile(e.target.files[0])} />
-          {loadingFile ? (
-            <div className="card">
-              <Spinner label={`"${loadingFile}" 여는 중…`} />
-            </div>
-          ) : (
-            <>
-              <button className="btn btn-primary btn-xl" onClick={() => fileRef.current?.click()}>
-                <Icon name="music" />
-                노래 파일 고르기
-              </button>
-              <button className="btn btn-secondary btn-xl" onClick={useDemo}>
-                파일 없이 연습용 비트로 해보기
-              </button>
-            </>
-          )}
-          <ul className="notes">
-            <li>mp3, m4a, wav 파일이나 화면 녹화 영상(mp4)을 쓸 수 있어요.</li>
-            <li>고른 구간만 방에 저장되고, 방 기간이 끝나면 녹음과 함께 지워져요.</li>
-            <li>친구끼리 즐기는 용도로만 써 주세요. 완성본을 공개된 곳에 올리면 원곡 저작권 문제가 생길 수 있어요.</li>
-          </ul>
-        </section>
+        <SongFinder q={q} onQ={setQ} busy={searching} search={search} onSearch={runSearch} onPick={(s) => pickSong(s)} onVideo={startWithVideo} onFile={() => chooseFile('song')} onDemo={useDemo} loadingFile={loadingFile} />
       )}
+
+      {step === 'source' && (
+        <SourcePicker
+          song={song}
+          lyr={{ ...lyr, syncedLines: sync.length }}
+          video={video}
+          finding={finding}
+          alts={alts}
+          ytReady={!!yt.player}
+          ytError={yt.error?.message || ''}
+          cand={cand}
+          onCandQ={(text) => setCand((c) => ({ ...c, q: text }))}
+          onCandSearch={() => void runCandSearch(cand.q)}
+          onPickSong={(s) => pickSong(s, true)}
+          onVideo={pickVideo}
+          onFile={() => chooseFile('source')}
+          checking={checking}
+          onNext={() => void sourceNext()}
+          onChangeSong={() => {
+            stopAudio();
+            setStep('song');
+          }}
+        />
+      )}
+
+      {step === 'range' &&
+        video &&
+        (hasSync ? (
+          <RangeLines sync={sync} player={yt.player} videoLen={videoLen} lyricsDur={lyr.data?.dur || song?.dur || 0} maxLen={cfg.ytSeconds} initial={lineRange} onConfirm={confirmLines} />
+        ) : (
+          <RangeTime player={yt.player} videoLen={videoLen} maxLen={cfg.ytSeconds} initial={seg} onConfirm={confirmTime} />
+        ))}
 
       {step === 'trim' && source && (
         <section className="stack">
@@ -387,10 +738,6 @@ export function Create() {
               1초 뒤로
             </button>
           </div>
-          <label className="field">
-            <span>방 이름 (곡 제목)</span>
-            <input id="room-title" className="input" value={title} maxLength={60} onChange={(e) => setTitle(e.target.value)} placeholder="예) 하트셰이커 커버" />
-          </label>
           <div className="bottom-bar">
             <button className="btn btn-primary btn-xl" onClick={confirmTrim}>
               이 구간으로 할게요
@@ -402,10 +749,22 @@ export function Create() {
       {step === 'lyrics' && (
         <section className="stack">
           <h1 className="title">가사를 넣어 주세요</h1>
-          <p className="lead">고른 구간의 가사만, 한 줄에 한 소절씩 붙여 넣어요. 녹음할 때 노래방처럼 보여 줘요.</p>
-          <UploadPill upload={upload} onRetry={() => segment && source && prepare(segment, title.trim(), source.name, false)} />
+          <p className="lead">고른 구간의 가사만, 한 줄에 한 소절씩 넣어요. 녹음할 때 노래방처럼 보여 줘요.</p>
+          <UploadPill upload={upload} quiet={mode === 'yt'} onRetry={retryPrepare} />
+          {mode === 'file' && hasSync && (
+            <div className="card">
+              <h3 className="card-title">
+                <Icon name="spark" size={20} /> 찾아 둔 가사가 있어요
+              </h3>
+              <p className="hint">줄마다 타이밍까지 들어 있어요. 올린 파일이 음원 그대로라면 바로 맞아요.</p>
+              <button className="btn btn-primary" onClick={useFoundSynced}>
+                찾아 둔 가사 쓰기
+              </button>
+            </div>
+          )}
+          {!!lyr.data?.plain && lyrics === lyr.data.plain && <p className="hint">찾아온 곡 전체 가사예요. 고른 구간에 없는 줄은 지워 주세요.</p>}
           <textarea id="lyrics" className="input lyrics-input" rows={9} value={lyrics} onChange={(e) => setLyrics(e.target.value)} placeholder={'첫 소절\n둘째 소절\n셋째 소절…'} />
-          {aiOn && (
+          {aiOn && mode === 'file' && (
             <button className="btn btn-secondary" disabled={!draft || aiBusy} onClick={transcribeWithAi}>
               <Icon name="spark" size={18} />
               {aiBusy ? 'AI가 듣는 중…' : draft ? 'AI에게 가사 받아쓰기 맡기기' : '노래가 올라가면 AI를 쓸 수 있어요'}
@@ -422,15 +781,15 @@ export function Create() {
         </section>
       )}
 
-      {step === 'timing' && segment && (
+      {step === 'timing' && dur > 0 && (
         <section className="stack">
           <h1 className="title">가사 타이밍을 맞춰요</h1>
           {!timed ? (
             <>
               <p className="lead">각 줄이 노래의 어디에서 시작하는지 알려 주세요. 방법을 하나 골라요.</p>
-              <UploadPill upload={upload} onRetry={() => source && prepare(segment, title.trim(), source.name, false)} />
+              <UploadPill upload={upload} quiet={mode === 'yt'} onRetry={retryPrepare} />
               <div className="choice-list">
-                {aiOn && (
+                {aiOn && mode === 'file' && (
                   <button className="choice" disabled={!draft || aiBusy} onClick={timeWithAi}>
                     <Icon name="spark" />
                     <span>
@@ -458,6 +817,15 @@ export function Create() {
           ) : (
             <>
               <p className="lead">{timingNote || '줄마다 ▶ 로 들어 보고, 빠르거나 느리면 − / + 로 옮겨 주세요.'}</p>
+              <div className="shift-all" role="group" aria-label="가사 전체 옮기기">
+                <span>가사 전체</span>
+                <button className="btn btn-secondary btn-sm" onClick={() => shiftAll(-0.5)}>
+                  0.5초 앞으로
+                </button>
+                <button className="btn btn-secondary btn-sm" onClick={() => shiftAll(0.5)}>
+                  0.5초 뒤로
+                </button>
+              </div>
               <ol className="timing-list">
                 {timed.map((l) => (
                   <li key={l.id}>
@@ -496,11 +864,12 @@ export function Create() {
         </section>
       )}
 
-      {step === 'tap' && segment && (
+      {step === 'tap' && dur > 0 && (
         <TapSync
           texts={texts}
-          buffer={segment.buffer}
-          getTransport={transport}
+          dur={dur}
+          getDeck={getDeck}
+          video={mode === 'yt'}
           onCancel={() => setStep('timing')}
           onDone={(starts) => {
             const lines = linesFromStarts(texts.slice(0, starts.length), starts, dur);
@@ -512,16 +881,16 @@ export function Create() {
         />
       )}
 
-      {step === 'parts' && segment && (
+      {step === 'parts' && dur > 0 && (
         <section className="stack">
           <h1 className="title">파트를 나눠요</h1>
           <p className="lead">일단 고르게 나눠 뒀어요. 친구들은 방에 들어와서 원하는 색을 고르면 돼요.</p>
-          <UploadPill upload={upload} onRetry={() => source && prepare(segment, title.trim(), source.name, source.demo)} />
+          <UploadPill upload={upload} quiet={mode === 'yt'} onRetry={retryPrepare} />
           <PartsEditor
             lines={parts}
             seatCount={seatCount}
             dur={dur}
-            songPeaks={segment.peaks}
+            songPeaks={mode === 'yt' ? '' : (segment?.peaks ?? '')}
             ai={draft && texts.length ? draft : null}
             aiAvailable={aiOn}
             onChange={(l, n) => {
@@ -533,12 +902,26 @@ export function Create() {
             <Toggle id="blind" checked={blind} onChange={setBlind} label="블라인드 모드" hint="모두 녹음을 마칠 때까지 서로의 녹음을 들을 수 없어요. 다 모이면 한꺼번에 공개해요." />
           </div>
           <label className="field">
+            <span>방 이름</span>
+            <input
+              id="room-title"
+              className="input"
+              value={title}
+              maxLength={60}
+              onChange={(e) => {
+                titleTouched.current = true;
+                setTitle(e.target.value);
+              }}
+              placeholder="친구들에게 보일 방 이름"
+            />
+          </label>
+          <label className="field">
             <span>내 이름</span>
             <input id="host-name" className="input" value={hostName} maxLength={16} onChange={(e) => setHostName(e.target.value)} placeholder="친구들에게 보일 이름" autoComplete="nickname" />
           </label>
           <div className="bottom-bar">
             <button className="btn btn-primary btn-xl" onClick={openRoom} disabled={!draft || opening}>
-              {opening ? '방 여는 중…' : draft ? '방 열고 번호 받기' : upload.state === 'failed' ? '노래를 다시 올려 주세요' : '노래 올리는 중…'}
+              {opening ? '방 여는 중…' : draft ? '방 열고 번호 받기' : upload.state === 'failed' ? '다시 준비해 주세요' : mode === 'yt' ? '방을 준비하는 중…' : '노래 올리는 중…'}
             </button>
           </div>
         </section>
@@ -578,10 +961,11 @@ export function Create() {
   );
 }
 
-function UploadPill({ upload, onRetry }: { upload: Upload; onRetry: () => void }) {
+/** 방 준비 상황. quiet: 올릴 파일이 없는 유튜브 반주에서는 잘 됐을 때 아무것도 보여 주지 않는다. */
+function UploadPill({ upload, onRetry, quiet }: { upload: Upload; onRetry: () => void; quiet?: boolean }) {
   if (upload.state === 'idle') return null;
   if (upload.state === 'ready')
-    return (
+    return quiet ? null : (
       <p className="pill pill-ok">
         <Icon name="check" size={16} /> 노래가 방에 올라갔어요
       </p>
@@ -591,10 +975,11 @@ function UploadPill({ upload, onRetry }: { upload: Upload; onRetry: () => void }
       <p className="pill pill-bad">
         {upload.message}
         <button className="link-btn" onClick={onRetry}>
-          다시 올리기
+          {quiet ? '다시 시도' : '다시 올리기'}
         </button>
       </p>
     );
+  if (quiet) return null;
   return (
     <p className="pill">
       <span className="spinner" /> {upload.label} {Math.round(upload.progress * 100)}%
@@ -602,245 +987,3 @@ function UploadPill({ upload, onRetry }: { upload: Upload; onRetry: () => void }
   );
 }
 
-// ───────── 구간 고르기 상자 ─────────
-function TrimBox({ source, sel, onChange }: { source: Source; sel: { start: number; len: number }; onChange: (s: { start: number; len: number }) => void }) {
-  const wrapRef = useRef<HTMLDivElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  const drag = useRef<{ x: number; start: number } | null>(null);
-  const total = source.buffer.duration;
-
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    const wrap = wrapRef.current;
-    if (!canvas || !wrap) return;
-    const draw = () => {
-      const w = wrap.clientWidth;
-      const h = 84;
-      const dpr = Math.min(3, window.devicePixelRatio || 1);
-      canvas.width = w * dpr;
-      canvas.height = h * dpr;
-      const c = canvas.getContext('2d')!;
-      c.setTransform(dpr, 0, 0, dpr, 0, 0);
-      c.clearRect(0, 0, w, h);
-      c.fillStyle = '#2BD576';
-      const p = source.peaks;
-      for (let x = 0; x < w; x += 3) {
-        const a = Math.floor((x / w) * p.length);
-        const b = Math.max(a + 1, Math.floor(((x + 3) / w) * p.length));
-        let m = 0;
-        for (let i = a; i < b; i++) m = Math.max(m, p[i]);
-        const bar = Math.max(2, (m / 255) * (h - 10));
-        c.fillRect(x, (h - bar) / 2, 2, bar);
-      }
-    };
-    draw();
-    const ro = new ResizeObserver(draw);
-    ro.observe(wrap);
-    return () => ro.disconnect();
-  }, [source]);
-
-  const clampStart = (s: number) => Math.max(0, Math.min(total - sel.len, s));
-  const toTime = (clientX: number) => {
-    const r = wrapRef.current!.getBoundingClientRect();
-    return ((clientX - r.left) / r.width) * total;
-  };
-
-  return (
-    <div className="trim">
-      <div
-        className="trim-wave"
-        ref={wrapRef}
-        onPointerDown={(e) => {
-          (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-          const t = toTime(e.clientX);
-          const inside = t >= sel.start && t <= sel.start + sel.len;
-          const start = inside ? sel.start : clampStart(t - sel.len / 2);
-          if (!inside) onChange({ ...sel, start });
-          drag.current = { x: e.clientX, start };
-        }}
-        onPointerMove={(e) => {
-          if (!drag.current || !e.buttons) return;
-          const r = wrapRef.current!.getBoundingClientRect();
-          onChange({ ...sel, start: clampStart(drag.current.start + ((e.clientX - drag.current.x) / r.width) * total) });
-        }}
-        onPointerUp={() => (drag.current = null)}
-        role="slider"
-        tabIndex={0}
-        aria-label="구간 시작 위치"
-        aria-valuemin={0}
-        aria-valuemax={Math.round(total - sel.len)}
-        aria-valuenow={Math.round(sel.start)}
-        aria-valuetext={`${fmtTime(sel.start)}부터 ${fmtTime(sel.start + sel.len)}까지`}
-        onKeyDown={(e) => {
-          if (e.key === 'ArrowLeft') onChange({ ...sel, start: clampStart(sel.start - 1) });
-          if (e.key === 'ArrowRight') onChange({ ...sel, start: clampStart(sel.start + 1) });
-        }}
-      >
-        <canvas ref={canvasRef} />
-        <div className="trim-window" style={{ left: `${(sel.start / total) * 100}%`, width: `${(sel.len / total) * 100}%` }} />
-      </div>
-      <p className="trim-times">
-        <strong>
-          {fmtTime(sel.start)} ~ {fmtTime(sel.start + sel.len)}
-        </strong>
-        <span>
-          전체 {fmtTime(total)} 중 {Math.round(sel.len)}초
-        </span>
-      </p>
-    </div>
-  );
-}
-
-function PreviewButton({ source, sel, getTransport }: { source: Source; sel: { start: number; len: number }; getTransport: () => Promise<Transport> }) {
-  const [on, setOn] = useState(false);
-  const tRef = useRef<Transport | null>(null);
-  const key = `${sel.start.toFixed(2)}:${sel.len}`;
-  useEffect(() => {
-    // 구간을 옮기면 재생을 멈춘다
-    tRef.current?.stop();
-    setOn(false);
-  }, [key]);
-  useEffect(() => () => tRef.current?.stop(), []);
-  return (
-    <button
-      className="btn btn-secondary"
-      onClick={async () => {
-        const t = await getTransport();
-        tRef.current = t;
-        if (on) {
-          t.stop();
-          return setOn(false);
-        }
-        t.setSong(source.buffer);
-        t.setTakes([]);
-        t.play(sel.start, { until: sel.start + sel.len, withTakes: false, onEnd: () => setOn(false) });
-        setOn(true);
-      }}
-    >
-      <Icon name={on ? 'pause' : 'play'} size={18} />
-      {on ? '멈추기' : '구간 듣기'}
-    </button>
-  );
-}
-
-// ───────── 들으면서 탭하기 ─────────
-function TapSync({ texts, buffer, getTransport, onDone, onCancel }: { texts: string[]; buffer: AudioBuffer; getTransport: () => Promise<Transport>; onDone: (starts: number[]) => void; onCancel: () => void }) {
-  const [started, setStarted] = useState(false);
-  const [taps, setTaps] = useState<number[]>([]);
-  const tRef = useRef<Transport | null>(null);
-  const barRef = useRef<HTMLDivElement>(null);
-  const countRef = useRef<HTMLParagraphElement>(null);
-  const tapsRef = useRef<number[]>([]);
-  tapsRef.current = taps;
-  const next = taps.length;
-  const dur = buffer.duration;
-
-  const finish = useCallback(
-    (list: number[]) => {
-      tRef.current?.stop();
-      if (!list.length) return onCancel();
-      onDone(list);
-    },
-    [onCancel, onDone],
-  );
-
-  const begin = async (from: number) => {
-    const t = await getTransport();
-    tRef.current = t;
-    t.setSong(buffer);
-    t.setTakes([]);
-    t.play(from, { withTakes: false, countIn: from < 0, onEnd: () => finish(tapsRef.current) });
-    setStarted(true);
-  };
-
-  useEffect(() => () => tRef.current?.stop(), []);
-
-  useRaf(() => {
-    const t = tRef.current;
-    if (!t) return;
-    const pos = t.position();
-    if (barRef.current) barRef.current.style.width = `${Math.max(0, Math.min(1, pos / dur)) * 100}%`;
-    if (countRef.current) countRef.current.textContent = pos < 0 ? String(Math.ceil(-pos)) : '';
-  }, started);
-
-  const tap = () => {
-    const t = tRef.current;
-    if (!t || !t.playing) return;
-    const pos = t.position();
-    if (pos < -0.2) return;
-    // 누르는 손이 살짝 늦는 만큼 당겨 준다
-    const at = Math.max(0, pos - 0.08);
-    const list = [...tapsRef.current, at];
-    setTaps(list);
-    if (navigator.vibrate) navigator.vibrate(12);
-    if (list.length >= texts.length) window.setTimeout(() => finish(list), 500);
-  };
-
-  const undo = () => {
-    const list = tapsRef.current.slice(0, -1);
-    setTaps(list);
-    void begin(Math.max(0, (list[list.length - 1] ?? 0) - 2));
-  };
-
-  useEffect(() => {
-    if (!started) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.code === 'Space' || e.code === 'Enter') {
-        e.preventDefault();
-        tap();
-      }
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [started]);
-
-  if (!started) {
-    return (
-      <section className="stack">
-        <h1 className="title">들으면서 탭하기</h1>
-        <p className="lead">노래가 나오면, 화면에 보이는 줄이 시작되는 순간마다 큰 버튼을 눌러 주세요. 틀리면 "한 줄 되돌리기"를 누르면 돼요.</p>
-        <div className="card">
-          <p className="tap-preview">{texts[0]}</p>
-          <p className="hint">첫 줄이에요. 셋을 센 뒤 노래가 시작돼요.</p>
-        </div>
-        <div className="bottom-bar">
-          <button className="btn btn-primary btn-xl" onClick={() => begin(-3)}>
-            시작하기
-          </button>
-          <button className="btn btn-ghost" onClick={onCancel}>
-            취소
-          </button>
-        </div>
-      </section>
-    );
-  }
-
-  return (
-    <section className="tap-stage">
-      <div className="tap-progress">
-        <div ref={barRef} />
-      </div>
-      <p className="tap-count" ref={countRef} aria-hidden="true" />
-      <div className="tap-lines">
-        <p className="tap-done">{next > 0 ? texts[next - 1] : ''}</p>
-        <p className="tap-now">{texts[next] ?? '끝!'}</p>
-        <p className="tap-next">{texts[next + 1] ?? ''}</p>
-      </div>
-      <button className="tap-button" onPointerDown={tap} disabled={next >= texts.length}>
-        <span>이 줄 시작!</span>
-        <small>
-          {Math.min(next + 1, texts.length)} / {texts.length}
-        </small>
-      </button>
-      <div className="tap-tools">
-        <button className="btn btn-ghost" onClick={undo} disabled={!taps.length}>
-          <Icon name="redo" size={18} /> 한 줄 되돌리기
-        </button>
-        <button className="btn btn-ghost" onClick={() => finish(tapsRef.current)}>
-          여기까지만 쓰기
-        </button>
-      </div>
-    </section>
-  );
-}

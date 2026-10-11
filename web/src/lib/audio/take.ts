@@ -24,7 +24,11 @@ export interface PassPlan {
   countIn: boolean;
 }
 
-export function planPass(pass: Pass, songDur: number): PassPlan {
+export function planPass(pass: Pass, songDur: number, yt?: { start: number }): PassPlan {
+  if (yt) {
+    // 유튜브 반주: 구간 앞쪽의 영상을 미리 틀 수 있지만 영상 맨 앞보다 앞으로는 못 간다. 박자 세는 소리는 넣지 않는다.
+    return { from: Math.max(-yt.start, pass.t0 - PRE_ROLL), until: Math.min(songDur + POST_ROLL, pass.t1 + POST_ROLL), countIn: false };
+  }
   const from = pass.t0 - PRE_ROLL;
   return {
     from,
@@ -38,6 +42,11 @@ export interface RawTake {
   capture: Capture;
   /** 구간 0초가 나온 컨텍스트 시각 */
   tZero: number;
+  /**
+   * (유튜브 반주) 줄마다 따로 잰 tZero, pass.lines 순서대로.
+   * 부르는 도중에 영상과 우리 소리 시계의 차이가 옮겨 갔을 때 각 줄을 제자리에 놓으려는 것이다.
+   */
+  zeros?: number[];
   plan: PassPlan;
   pass: Pass;
 }
@@ -63,6 +72,7 @@ export interface CutTake {
 export function cutTake(raw: RawTake, latencySec: number): CutTake {
   const { capture, tZero, pass } = raw;
   const sr = capture.sampleRate;
+  if (raw.zeros && raw.zeros.length === pass.lines.length && raw.zeros.some((z) => z !== tZero)) return cutByLines(raw, raw.zeros, latencySec);
   // samples[i] 가 실제로 불린 구간 시각 = (firstFrame + i)/sr - tZero - latency
   const indexOf = (segTime: number) => Math.round((segTime + tZero + latencySec) * sr) - capture.firstFrame;
   const a = Math.max(0, indexOf(pass.t0 - MARGIN_BEFORE));
@@ -70,6 +80,32 @@ export function cutTake(raw: RawTake, latencySec: number): CutTake {
   const samples = capture.samples.slice(a, Math.max(a + 1, b));
   const start = (capture.firstFrame + a) / sr - tZero - latencySec;
   return { samples, sampleRate: sr, start, dur: samples.length / sr, windows: pass.lines.map((l) => [l.t0, l.t1]) };
+}
+
+/**
+ * 줄마다 다른 tZero 로 잘라 이어 붙인다. 줄과 줄 사이(조용한 곳)의 한가운데에서 값을 바꾼다.
+ * 결과는 구간 시각으로 끊김 없이 이어진 한 덩어리다.
+ */
+function cutByLines(raw: RawTake, zeros: number[], latencySec: number): CutTake {
+  const { capture, pass } = raw;
+  const sr = capture.sampleRate;
+  const lines = pass.lines;
+  const startSeg = pass.t0 - MARGIN_BEFORE;
+  const endSeg = pass.t1 + MARGIN_AFTER;
+  const total = Math.max(1, Math.round((endSeg - startSeg) * sr));
+  const samples = new Float32Array(total);
+  for (let i = 0; i < lines.length; i++) {
+    const segFrom = i === 0 ? startSeg : (lines[i - 1].t1 + lines[i].t0) / 2;
+    const segTo = i + 1 < lines.length ? (lines[i].t1 + lines[i + 1].t0) / 2 : endSeg;
+    const outFrom = Math.max(0, Math.round((segFrom - startSeg) * sr));
+    const outTo = Math.min(total, Math.round((segTo - startSeg) * sr));
+    // samples[n] 이 불린 구간 시각 = startSeg + n/sr  ↔  녹음의 (그 시각 + tZero + 지연) 자리
+    const shift = Math.round((startSeg + zeros[i] + latencySec) * sr) - capture.firstFrame;
+    const a = Math.max(outFrom, -shift);
+    const b = Math.min(outTo, capture.samples.length - shift);
+    if (b > a) samples.set(capture.samples.subarray(a + shift, b + shift), a);
+  }
+  return { samples, sampleRate: sr, start: startSeg, dur: total / sr, windows: lines.map((l) => [l.t0, l.t1]) };
 }
 
 export interface FinalTake {

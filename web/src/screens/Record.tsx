@@ -14,9 +14,15 @@ import { useRoom } from '../lib/room';
 import { audibleTakes, loadPlayTakes } from '../lib/roomAudio';
 import { seatNames } from '../lib/roomView';
 import { store } from '../lib/store';
+import { YtDeck, type DeckEvent } from '../lib/yt/deck';
+import type { YtPlayer } from '../lib/yt/player';
+import { useYtPlayer, YtFrame, YtTapNote } from '../lib/yt/useYt';
 import { Icon, InAppNotice, Sheet, Spinner, Toggle, TopBar, useRaf, useToast } from '../ui';
 
 type Phase = 'prep' | 'opening' | 'ready' | 'rolling' | 'processing' | 'review' | 'saving' | 'saved' | 'done';
+
+/** 유튜브 반주에서, 부르는 동안 잰 싱크 값이 이보다 흩어지면 영상이 끊긴 것으로 본다 (초) */
+const YT_SPREAD_MAX = 0.06;
 
 interface Review {
   raw: RawTake;
@@ -24,6 +30,8 @@ interface Review {
   reported: number;
   fin: FinalTake & { processed: Float32Array };
   sampleRate: number;
+  /** 유튜브 반주일 때: 부르는 동안 영상이 멈칫했는지 */
+  shaky?: boolean;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -40,8 +48,17 @@ export function Record({ code }: { code: string }) {
   const [revPlaying, setRevPlaying] = useState(false);
   const [calib, setCalib] = useState<{ open: boolean; state: 'idle' | 'running' | 'ok' | 'fail'; ms?: number }>({ open: false, state: 'idle' });
   const [notice, setNotice] = useState('');
+  // 유튜브 영상을 반주로 쓰는 방: 영상은 플레이어가 틀고, 싱크는 영상 시계를 따라 잡는다
+  const ytRef = room?.song.yt;
+  const isYt = !!ytRef;
+  const yt = useYtPlayer(ytRef?.id);
+  const ytPlayerRef = useRef<YtPlayer | null>(null);
+  ytPlayerRef.current = yt.player;
+  const [ytTap, setYtTap] = useState(false);
+  const [rollReady, setRollReady] = useState(false);
+  const [stageSinging, setStageSinging] = useState(false);
   const micRef = useRef<Mic | null>(null);
-  const tRef = useRef<Transport | null>(null);
+  const tRef = useRef<Transport | YtDeck | null>(null);
   const songRef = useRef<AudioBuffer | null>(null);
   const othersRef = useRef<PlayTake[]>([]);
   const rollRef = useRef<{ pass: Pass; plan: PassPlan; tZero: number } | null>(null);
@@ -105,10 +122,31 @@ export function Record({ code }: { code: string }) {
     if (mic && meterRef.current) meterRef.current.style.transform = `scaleX(${mic.level().toFixed(3)})`;
   }, phase === 'ready' || phase === 'saved' || phase === 'rolling');
 
+  // ───────── 유튜브 재생기에서 오는 알림 ─────────
+  const onDeckEvent = (e: DeckEvent) => {
+    if (e.type === 'needTap') setYtTap(e.on);
+    if (phaseRef.current === 'rolling') {
+      if (e.type === 'ready') setRollReady(true);
+      else if (e.type === 'paused') {
+        void abortPass();
+        toast('영상이 멈춰서 녹음을 멈췄어요. 녹음하는 동안에는 영상을 누르지 말아 주세요.', 'error');
+      } else if (e.type === 'failed') {
+        void abortPass();
+        toast(e.error.message, 'error');
+      }
+    } else if (e.type === 'paused' || e.type === 'failed') {
+      setRevPlaying(false);
+      if (e.type === 'failed' && phaseRef.current === 'review') toast(e.error.message, 'error');
+    }
+  };
+  const deckEventRef = useRef(onDeckEvent);
+  deckEventRef.current = onDeckEvent;
+
   // ───────── 마이크 켜기 ─────────
   const openMic = async (next = pref) => {
     const r = roomRef.current;
-    if (!r?.song.blob) return;
+    if (!r || (!r.song.blob && !r.song.yt)) return;
+    if (r.song.yt && !ytPlayerRef.current) return toast(yt.error?.message || '영상을 불러오는 중이에요. 잠시 뒤에 다시 눌러 주세요.', 'error');
     setPhase('opening');
     setNotice('');
     try {
@@ -132,12 +170,21 @@ export function Record({ code }: { code: string }) {
       const mic = await Mic.open(provide, { deviceId: next.deviceId || undefined, echoCancel: !next.earphones });
       if (!aliveRef.current) return mic.close();
       micRef.current = mic;
-      const song = await loadAudio(code, r.song.blob, who);
-      songRef.current = song;
-      othersRef.current = await loadPlayTakes(r, who, audibleTakes(r).filter((t) => t.seat !== r.me?.seat));
-      const t = new Transport(mic.ctx);
-      t.setSong(song);
-      tRef.current = t;
+      const player = ytPlayerRef.current;
+      if (r.song.yt && player) {
+        songRef.current = null;
+        othersRef.current = await loadPlayTakes(r, who, audibleTakes(r).filter((t) => t.seat !== r.me?.seat), store.ytShift());
+        const deck = new YtDeck(mic.ctx, player, { start: r.song.yt.start, dur: r.song.dur, len: r.song.yt.len });
+        deck.on((e) => deckEventRef.current(e));
+        tRef.current = deck;
+      } else {
+        const song = await loadAudio(code, r.song.blob!, who);
+        songRef.current = song;
+        othersRef.current = await loadPlayTakes(r, who, audibleTakes(r).filter((t) => t.seat !== r.me?.seat));
+        const t = new Transport(mic.ctx);
+        t.setSong(song);
+        tRef.current = t;
+      }
       setDevices(await listMics());
       setPhase('ready');
     } catch (e) {
@@ -210,26 +257,45 @@ export function Record({ code }: { code: string }) {
   const startPass = async () => {
     const mic = micRef.current;
     const t = tRef.current;
-    const song = songRef.current;
-    if (!mic || !t || !song || !current) return;
-    try {
-      await mic.ctx.resume();
-    } catch {
-      /* 무시 */
-    }
-    const plan = planPass(current, song.duration);
+    const r = roomRef.current;
+    if (!mic || !t || !r || !current) return;
     const hear = pref.hearOthers && othersRef.current.length > 0;
-    t.setTakes(hear ? othersRef.current : []);
-    t.setMix({ backing: pref.guide, seats: {}, echo: 0.1 });
-    t.displayLatency = displayLatency(reportedOutputLatency(mic.ctx), reportedLatency(mic.ctx, mic.inputLatency));
     window.clearTimeout(nudgeTimer.current);
-    const seq = ++rollSeq.current;
-    mic.start();
-    const tZero = t.play(plan.from, { until: plan.until, countIn: plan.countIn, withTakes: hear, onEnd: () => void finishPass(seq) });
-    rollRef.current = { pass: current, plan, tZero };
-    // 재생 끝 신호를 놓쳐도 녹음 화면에 갇히지 않게 하는 안전장치
     window.clearTimeout(watchdog.current);
-    watchdog.current = window.setTimeout(() => void finishPass(seq), (plan.until - plan.from + 2.5) * 1000);
+    if (t instanceof YtDeck) {
+      // 영상은 누른 그 순간에 시작시켜야 한다 (휴대폰 브라우저는 누른 직후에만 재생을 허락한다)
+      const plan = planPass(current, r.song.dur, t.seg);
+      t.setTakes(hear ? othersRef.current : []);
+      t.setMix({ backing: pref.guide, seats: {}, echo: 0.1 });
+      const seq = ++rollSeq.current;
+      mic.start();
+      setRollReady(false);
+      rollRef.current = { pass: current, plan, tZero: NaN };
+      t.play(plan.from, { until: plan.until, withTakes: hear, onEnd: () => void finishPass(seq) }).catch(() => {
+        /* 실패는 재생기 알림(failed)으로 처리한다 */
+      });
+      // 영상이 시작되기를 기다리는 시간까지 넉넉히 잡은 안전장치
+      watchdog.current = window.setTimeout(() => void finishPass(seq), (plan.until - plan.from + 150) * 1000);
+    } else {
+      const song = songRef.current;
+      if (!song) return;
+      try {
+        await mic.ctx.resume();
+      } catch {
+        /* 무시 */
+      }
+      const plan = planPass(current, song.duration);
+      t.setTakes(hear ? othersRef.current : []);
+      t.setMix({ backing: pref.guide, seats: {}, echo: 0.1 });
+      t.displayLatency = displayLatency(reportedOutputLatency(mic.ctx), reportedLatency(mic.ctx, mic.inputLatency));
+      const seq = ++rollSeq.current;
+      mic.start();
+      const tZero = t.play(plan.from, { until: plan.until, countIn: plan.countIn, withTakes: hear, onEnd: () => void finishPass(seq) });
+      rollRef.current = { pass: current, plan, tZero };
+      setRollReady(true);
+      // 재생 끝 신호를 놓쳐도 녹음 화면에 갇히지 않게 하는 안전장치
+      watchdog.current = window.setTimeout(() => void finishPass(seq), (plan.until - plan.from + 2.5) * 1000);
+    }
     setReview(null);
     setNudge(0);
     setPhase('rolling');
@@ -244,11 +310,15 @@ export function Record({ code }: { code: string }) {
     if (seq !== rollSeq.current || phaseRef.current === 'processing') return;
     rollSeq.current++;
     window.clearTimeout(watchdog.current);
-    tRef.current?.stop();
     const mic = micRef.current;
     const roll = rollRef.current;
     const song = songRef.current;
-    if (!mic || !roll || !song) return setPhase('ready');
+    const deck = tRef.current instanceof YtDeck ? tRef.current : null;
+    // 유튜브 반주: 부르는 동안 잰 "영상 시계 ↔ 소리 시계" 값을 멈추기 전에 받아 둔다 (줄마다 따로)
+    const fit = deck && roll ? deck.zerosFor(roll.pass.lines.map((l) => [l.t0, l.t1])) : null;
+    const stalls = deck ? deck.stalls : 0;
+    tRef.current?.stop();
+    if (!mic || !roll || (!song && !deck)) return setPhase('ready');
     phaseRef.current = 'processing';
     setPhase('processing');
     await sleep(TAIL_CAPTURE * 1000);
@@ -259,10 +329,15 @@ export function Record({ code }: { code: string }) {
       toast('녹음된 소리가 없어요. 마이크를 확인하고 다시 해 주세요.', 'error');
       return setPhase('ready');
     }
+    if (deck && !fit) {
+      toast('영상이 끊겨서 싱크를 잡지 못했어요. 인터넷 연결을 확인하고 다시 불러 주세요.', 'error');
+      return setPhase('ready');
+    }
     await sleep(30); // 화면이 "정리 중"으로 바뀔 틈
     try {
-      const raw: RawTake = { capture, tZero: roll.tZero, plan: roll.plan, pass: roll.pass };
-      const est = mic.echoCancel ? null : measureLatency(raw, song);
+      const raw: RawTake = { capture, tZero: fit ? fit.overall.tZero : roll.tZero, zeros: fit?.lines, plan: roll.plan, pass: roll.pass };
+      // 유튜브 영상의 소리는 우리가 들여다볼 수 없어서 "새어 들어간 반주"로 재는 방법을 쓸 수 없다
+      const est = deck || mic.echoCancel ? null : measureLatency(raw, song);
       const reported = reportedLatency(mic.ctx, mic.inputLatency);
       const choice = chooseLatency(est, reported);
       const fin = await finishTake(cutTake(raw, choice.sec));
@@ -270,7 +345,7 @@ export function Record({ code }: { code: string }) {
       // 자동으로 잰 경우에는 지난번에 일부러 옮겨 둔 만큼을 막대 시작 위치로 쓴다
       const startNudge = choice.source === 'measured' ? userBias() : 0;
       setNudge(startNudge);
-      setReview({ raw, choice, reported, fin, sampleRate: capture.sampleRate });
+      setReview({ raw, choice, reported, fin, sampleRate: capture.sampleRate, shaky: !!fit && (fit.spread > YT_SPREAD_MAX || stalls > 0) });
       setPhase('review');
       void playReview(fin, startNudge, capture.sampleRate, roll.pass);
     } catch {
@@ -304,14 +379,17 @@ export function Record({ code }: { code: string }) {
   // ───────── 들어보기 ─────────
   const playReview = async (fin: Review['fin'], offsetMs: number, sampleRate: number, pass: Pass) => {
     const t = tRef.current;
-    const song = songRef.current;
     const r = roomRef.current;
-    if (!t || !song || !r || r.me?.seat == null) return;
-    const mine: PlayTake = { id: 'preview', seat: r.me.seat, buffer: toBuffer(t.ctx, fin.processed, sampleRate), start: fin.start + offsetMs / 1000, gain: 1 };
+    if (!t || !r || r.me?.seat == null) return;
+    const yt = t instanceof YtDeck;
+    // 유튜브 반주에서는 이 기기에 맞춰 둔 "목소리 전체 타이밍"을 미리듣기에도 똑같이 적용한다
+    const shift = yt ? store.ytShift() : 0;
+    const mine: PlayTake = { id: 'preview', seat: r.me.seat, buffer: toBuffer(t.ctx, fin.processed, sampleRate), start: fin.start + (offsetMs + shift) / 1000, gain: 1 };
     t.setTakes([...othersRef.current, mine]);
-    t.setMix({ backing: 0.7, seats: {}, echo: 0.16 });
-    t.play(Math.max(0, pass.t0 - 2), { until: Math.min(song.duration, pass.t1 + 1), onEnd: () => setRevPlaying(false) });
+    t.setMix({ backing: yt ? Math.min(1, pref.guide) : 0.7, seats: {}, echo: 0.16 });
     setRevPlaying(true);
+    // 유튜브 반주는 영상이 실제로 돌기 시작해야 끝나는 약속을 돌려준다. 실패는 재생기 알림으로 처리한다.
+    void Promise.resolve(t.play(Math.max(0, pass.t0 - 2), { until: Math.min(r.song.dur, pass.t1 + 1), onEnd: () => setRevPlaying(false) })).catch(() => {});
   };
 
   const changeNudge = (v: number) => {
@@ -412,219 +490,246 @@ export function Record({ code }: { code: string }) {
     );
   }
   const others = audibleTakes(room).filter((t) => t.seat !== seat).length;
+  const rolling = phase === 'rolling' && !!rollRef.current && !!tRef.current;
+  const backing = isYt ? '영상' : '반주';
 
-  if (phase === 'rolling' && rollRef.current && tRef.current) {
-    return <Stage room={room} roll={rollRef.current} getPosition={() => tRef.current?.position() ?? 0} meterRef={meterRef} passLabel={`${(passIndex ?? 0) + 1} / ${passes.length}`} onCancel={abortPass} style={style} />;
-  }
-
+  // 유튜브 플레이어는 단계가 바뀌어도 같은 자리에 그대로 둔다 (자리를 옮기면 영상이 처음부터 다시 불러와진다).
+  // 그래서 녹음 무대와 나머지 화면이 같은 틀(main)을 쓰고, 영상의 위치는 CSS 로만 바꾼다.
   return (
-    <main className="page record" style={style}>
-      <TopBar onBack={leave} backLabel="방으로" title={phase === 'done' ? '' : `${seatName(seat)} 파트 녹음`} />
-
-      {(phase === 'prep' || phase === 'opening') && (
-        <section className="stack">
-          <h1 className="title">녹음 준비</h1>
-          <p className="lead">
-            {passes.length > 1 ? `내 파트는 ${passes.length}번에 나눠 녹음해요. ` : ''}반주가 4초 먼저 나오고, 내 차례가 되면 가사에 색이 들어와요.
-          </p>
-          <div className="choice-list" role="radiogroup" aria-label="듣는 방법">
-            <button className={`choice${pref.earphones ? ' is-on' : ''}`} role="radio" aria-checked={pref.earphones} onClick={() => changePref({ earphones: true })}>
-              <Icon name="headphones" />
-              <span>
-                <strong>이어폰을 꼈어요</strong>
-                <small>추천. 목소리만 깨끗하게 녹음돼요. 줄 이어폰이 가장 좋고, 블루투스는 소리가 늦거나 뭉개질 수 있어요.</small>
-              </span>
-            </button>
-            <button className={`choice${!pref.earphones ? ' is-on' : ''}`} role="radio" aria-checked={!pref.earphones} onClick={() => changePref({ earphones: false })}>
-              <Icon name="speaker" />
-              <span>
-                <strong>이어폰 없이 할게요</strong>
-                <small>스피커 반주가 같이 녹음되지 않게 걸러 줘요. 목소리가 조금 뭉개질 수 있어요.</small>
-              </span>
-            </button>
-          </div>
-          <InAppNotice />
-          {notice && <p className="pill">{notice}</p>}
-          <div className="bottom-bar">
-            <button className="btn btn-primary btn-xl" onClick={() => openMic()} disabled={phase === 'opening'}>
-              <Icon name="mic" />
-              {phase === 'opening' ? '마이크 켜는 중…' : '마이크 켜기'}
-            </button>
-            <p className="hint center">브라우저가 마이크를 써도 되는지 물으면 "허용"을 눌러 주세요.</p>
-          </div>
-        </section>
+    <main className={rolling ? `stage${isYt ? ' has-video' : ''}${stageSinging ? ' is-singing' : ''}` : 'page record'} style={style}>
+      {isYt && phase !== 'done' && (
+        <YtFrame yt={yt} note={!rolling && ytTap ? <YtTapNote /> : null} />
       )}
+      {rolling ? (
+        <Stage
+          room={room}
+          roll={rollRef.current!}
+          getPosition={() => tRef.current?.position() ?? 0}
+          meterRef={meterRef}
+          passLabel={`${(passIndex ?? 0) + 1} / ${passes.length}`}
+          onCancel={abortPass}
+          onSinging={setStageSinging}
+          ready={rollReady}
+          tapHint={isYt && ytTap}
+          video={isYt}
+        />
+      ) : (
+        <>
+          <TopBar onBack={leave} backLabel="방으로" title={phase === 'done' ? '' : `${seatName(seat)} 파트 녹음`} />
 
-      {(phase === 'ready' || phase === 'saved') && (
-        <section className="stack">
-          {phase === 'saved' ? (
-            <>
-              <h1 className="title">저장했어요</h1>
-              <p className="lead">이어서 다음 부분을 녹음해요.</p>
-            </>
-          ) : (
-            <>
-              <h1 className="title">마이크가 켜졌어요</h1>
-              <p className="lead">"아" 하고 소리를 내 보세요. 아래 막대가 움직이면 준비 끝이에요.</p>
-            </>
-          )}
-          <div className="meter" aria-hidden="true">
-            <div ref={meterRef} />
-          </div>
-
-          <ol className="pass-list">
-            {passes.map((p, i) => (
-              <li key={i}>
-                <button className={`pass${i === passIndex ? ' is-on' : ''}`} onClick={() => setPassIndex(i)} aria-pressed={i === passIndex}>
-                  <span className="pass-num">{i + 1}</span>
-                  <span className="pass-text">
-                    <strong>{p.lines.map((l) => l.text).filter(Boolean).slice(0, 2).join(' / ') || `${fmtTime(p.t0)} 구간`}</strong>
-                    <small>
-                      {fmtTime(p.t0)} ~ {fmtTime(p.t1)}, {p.lines.length}줄
-                    </small>
+          {(phase === 'prep' || phase === 'opening') && (
+            <section className="stack">
+              <h1 className="title">녹음 준비</h1>
+              <p className="lead">
+                {passes.length > 1 ? `내 파트는 ${passes.length}번에 나눠 녹음해요. ` : ''}
+                {backing}
+                {isYt ? '이' : '가'} 4초 먼저 나오고, 내 차례가 되면 가사에 색이 들어와요.
+              </p>
+              <div className="choice-list" role="radiogroup" aria-label="듣는 방법">
+                <button className={`choice${pref.earphones ? ' is-on' : ''}`} role="radio" aria-checked={pref.earphones} onClick={() => changePref({ earphones: true })}>
+                  <Icon name="headphones" />
+                  <span>
+                    <strong>이어폰을 꼈어요</strong>
+                    <small>추천. 목소리만 깨끗하게 녹음돼요. 줄 이어폰이 가장 좋고, 블루투스는 소리가 늦거나 뭉개질 수 있어요.</small>
                   </span>
-                  {recorded[i] ? (
-                    <span className="status status-done">
-                      <Icon name="check" size={15} /> 녹음됨
-                    </span>
-                  ) : (
-                    <span className="status">아직</span>
-                  )}
                 </button>
-              </li>
-            ))}
-          </ol>
+                <button className={`choice${!pref.earphones ? ' is-on' : ''}`} role="radio" aria-checked={!pref.earphones} onClick={() => changePref({ earphones: false })}>
+                  <Icon name="speaker" />
+                  <span>
+                    <strong>이어폰 없이 할게요</strong>
+                    <small>스피커 {backing}
+                      {isYt ? ' 소리' : ''}가 같이 녹음되지 않게 걸러 줘요. 목소리가 조금 뭉개질 수 있어요.</small>
+                  </span>
+                </button>
+              </div>
+              <InAppNotice />
+              {notice && <p className="pill">{notice}</p>}
+              {isYt && yt.error && <p className="pill pill-bad">{yt.error.message}</p>}
+              <div className="bottom-bar">
+                <button className="btn btn-primary btn-xl" onClick={() => openMic()} disabled={phase === 'opening' || (isYt && !yt.player)}>
+                  <Icon name="mic" />
+                  {phase === 'opening' ? '마이크 켜는 중…' : isYt && yt.loading ? '영상을 불러오는 중…' : '마이크 켜기'}
+                </button>
+                <p className="hint center">브라우저가 마이크를 써도 되는지 물으면 "허용"을 눌러 주세요.</p>
+              </div>
+            </section>
+          )}
 
-          <details className="card options">
-            <summary>소리 설정</summary>
-            <label className="field">
-              <span>반주 크기</span>
-              <input id="guide-vol" type="range" min={0.2} max={1.4} step={0.05} value={pref.guide} onChange={(e) => changePref({ guide: Number(e.target.value) })} />
-            </label>
-            {others > 0 && <Toggle id="hear-others" checked={pref.hearOthers} onChange={(v) => changePref({ hearOthers: v })} label="친구들 녹음도 같이 듣기" hint="먼저 녹음한 친구 목소리에 맞춰 부를 수 있어요." />}
-            {devices.length > 1 && (
-              <label className="field">
-                <span>마이크</span>
-                <select id="mic-device" className="input" value={pref.deviceId} onChange={(e) => changePref({ deviceId: e.target.value }, true)}>
-                  <option value="">기본 마이크</option>
-                  {devices.map((d) => (
-                    <option key={d.deviceId} value={d.deviceId}>
-                      {d.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-            )}
-            <button className="btn btn-secondary" onClick={() => changePref({ earphones: !pref.earphones }, true)}>
-              <Icon name={pref.earphones ? 'speaker' : 'headphones'} size={18} />
-              {pref.earphones ? '이어폰 없이 하기로 바꾸기' : '이어폰 끼고 하기로 바꾸기'}
-            </button>
-            {pref.earphones && (
-              <button className="btn btn-secondary" onClick={() => setCalib({ open: true, state: 'idle' })}>
-                싱크 미리 맞춰 두기
+          {(phase === 'ready' || phase === 'saved') && (
+            <section className="stack">
+              {phase === 'saved' ? (
+                <>
+                  <h1 className="title">저장했어요</h1>
+                  <p className="lead">이어서 다음 부분을 녹음해요.</p>
+                </>
+              ) : (
+                <>
+                  <h1 className="title">마이크가 켜졌어요</h1>
+                  <p className="lead">"아" 하고 소리를 내 보세요. 아래 막대가 움직이면 준비 끝이에요.</p>
+                </>
+              )}
+              <div className="meter" aria-hidden="true">
+                <div ref={meterRef} />
+              </div>
+
+              <ol className="pass-list">
+                {passes.map((p, i) => (
+                  <li key={i}>
+                    <button className={`pass${i === passIndex ? ' is-on' : ''}`} onClick={() => setPassIndex(i)} aria-pressed={i === passIndex}>
+                      <span className="pass-num">{i + 1}</span>
+                      <span className="pass-text">
+                        <strong>{p.lines.map((l) => l.text).filter(Boolean).slice(0, 2).join(' / ') || `${fmtTime(p.t0)} 구간`}</strong>
+                        <small>
+                          {fmtTime(p.t0)} ~ {fmtTime(p.t1)}, {p.lines.length}줄
+                        </small>
+                      </span>
+                      {recorded[i] ? (
+                        <span className="status status-done">
+                          <Icon name="check" size={15} /> 녹음됨
+                        </span>
+                      ) : (
+                        <span className="status">아직</span>
+                      )}
+                    </button>
+                  </li>
+                ))}
+              </ol>
+
+              <details className="card options">
+                <summary>소리 설정</summary>
+                <label className="field">
+                  <span>{isYt ? '영상 소리 크기' : '반주 크기'}</span>
+                  <input id="guide-vol" type="range" min={0.2} max={isYt ? 1 : 1.4} step={0.05} value={Math.min(pref.guide, isYt ? 1 : 1.4)} onChange={(e) => changePref({ guide: Number(e.target.value) })} />
+                </label>
+                {isYt && isIOS() && <p className="hint">아이폰·아이패드에서는 영상 소리 크기가 기기 음량을 따라가요.</p>}
+                {others > 0 && <Toggle id="hear-others" checked={pref.hearOthers} onChange={(v) => changePref({ hearOthers: v })} label="친구들 녹음도 같이 듣기" hint="먼저 녹음한 친구 목소리에 맞춰 부를 수 있어요." />}
+                {devices.length > 1 && (
+                  <label className="field">
+                    <span>마이크</span>
+                    <select id="mic-device" className="input" value={pref.deviceId} onChange={(e) => changePref({ deviceId: e.target.value }, true)}>
+                      <option value="">기본 마이크</option>
+                      {devices.map((d) => (
+                        <option key={d.deviceId} value={d.deviceId}>
+                          {d.label}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                )}
+                <button className="btn btn-secondary" onClick={() => changePref({ earphones: !pref.earphones }, true)}>
+                  <Icon name={pref.earphones ? 'speaker' : 'headphones'} size={18} />
+                  {pref.earphones ? '이어폰 없이 하기로 바꾸기' : '이어폰 끼고 하기로 바꾸기'}
+                </button>
+                {pref.earphones && (
+                  <button className="btn btn-secondary" onClick={() => setCalib({ open: true, state: 'idle' })}>
+                    싱크 미리 맞춰 두기
+                  </button>
+                )}
+              </details>
+
+              <div className="bottom-bar">
+                <button className="btn btn-rec btn-xl" onClick={startPass} disabled={!current}>
+                  <span className="rec-dot" />
+                  {current && recorded[passIndex ?? 0] ? `${(passIndex ?? 0) + 1}번 다시 녹음하기` : `${(passIndex ?? 0) + 1}번 녹음 시작`}
+                </button>
+              </div>
+            </section>
+          )}
+
+          {phase === 'processing' && (
+            <section className="stack empty">
+              <Spinner label="녹음을 정리하고 싱크를 맞추는 중…" />
+            </section>
+          )}
+
+          {(phase === 'review' || phase === 'saving') && review && (
+            <section className="stack">
+              <h1 className="title">들어 보세요</h1>
+              <p className="lead">{reviewMessage(review, isYt)}</p>
+              {warnings(review, pref.earphones).map((w) => (
+                <p key={w} className="pill pill-bad">
+                  {w}
+                </p>
+              ))}
+              <div className="card review-card">
+                <button
+                  className="play-btn"
+                  onClick={() => {
+                    if (revPlaying) {
+                      tRef.current?.pause();
+                      setRevPlaying(false);
+                    } else void playReview(review.fin, nudge, review.sampleRate, review.raw.pass);
+                  }}
+                  aria-label={revPlaying ? '멈추기' : '다시 듣기'}
+                >
+                  <Icon name={revPlaying ? 'pause' : 'play'} size={26} />
+                </button>
+                <TakeWave fin={review.fin} pass={review.raw.pass} nudge={nudge} getPosition={() => tRef.current?.position() ?? 0} playing={revPlaying} />
+              </div>
+              <div className="card sync-card">
+                <div className="sync-head">
+                  <strong>목소리 타이밍</strong>
+                  <output>{nudge === 0 ? '그대로' : nudge > 0 ? `${nudge}ms 늦게` : `${-nudge}ms 빠르게`}</output>
+                </div>
+                <div className="sync-row">
+                  <button className="icon-btn" onClick={() => changeNudge(nudge - 10)} aria-label="10ms 빠르게">
+                    <Icon name="minus" />
+                  </button>
+                  <input id="sync-nudge" type="range" min={-300} max={300} step={10} value={nudge} onChange={(e) => changeNudge(Number(e.target.value))} aria-label="목소리 타이밍" />
+                  <button className="icon-btn" onClick={() => changeNudge(nudge + 10)} aria-label="10ms 늦게">
+                    <Icon name="plus" />
+                  </button>
+                </div>
+                <p className="hint">
+                  목소리가 {backing}보다 늦게 들리면 왼쪽(빠르게), 앞서 나가면 오른쪽(늦게)으로 옮겨요. 한 번 맞추면 다음 녹음부터 그대로 적용돼요.
+                </p>
+                {review.choice.source !== 'measured' && pref.earphones && phase === 'review' && (
+                  <button className="btn btn-secondary" onClick={() => setCalib({ open: true, state: 'idle' })}>
+                    귀로 맞추기 어려우면 자동으로 재기
+                  </button>
+                )}
+              </div>
+              <div className="bottom-bar two">
+                <button
+                  className="btn btn-secondary btn-xl"
+                  disabled={phase === 'saving'}
+                  onClick={() => {
+                    window.clearTimeout(nudgeTimer.current);
+                    tRef.current?.stop();
+                    setRevPlaying(false);
+                    setPhase('ready');
+                  }}
+                >
+                  <Icon name="redo" />
+                  다시 부르기
+                </button>
+                <button className="btn btn-primary btn-xl" onClick={save} disabled={phase === 'saving'}>
+                  {phase === 'saving' ? '올리는 중…' : '이걸로 저장'}
+                </button>
+              </div>
+            </section>
+          )}
+
+          {phase === 'done' && (
+            <section className="stack done">
+              <p className="eyebrow-plain">{seatName(seat)} 파트</p>
+              <h1 className="title">다 불렀어요!</h1>
+              <p className="lead center">{room.blind && !room.revealed ? '모두 녹음을 마치면 한꺼번에 공개돼요.' : '방으로 돌아가면 지금까지 합쳐진 노래를 들을 수 있어요.'}</p>
+              <button className="btn btn-primary btn-xl" onClick={() => navigate(`/r/${code}`)}>
+                방으로 돌아가기
               </button>
-            )}
-          </details>
-
-          <div className="bottom-bar">
-            <button className="btn btn-rec btn-xl" onClick={startPass} disabled={!current}>
-              <span className="rec-dot" />
-              {current && recorded[passIndex ?? 0] ? `${(passIndex ?? 0) + 1}번 다시 녹음하기` : `${(passIndex ?? 0) + 1}번 녹음 시작`}
-            </button>
-          </div>
-        </section>
-      )}
-
-      {phase === 'processing' && (
-        <section className="stack empty">
-          <Spinner label="녹음을 정리하고 싱크를 맞추는 중…" />
-        </section>
-      )}
-
-      {(phase === 'review' || phase === 'saving') && review && (
-        <section className="stack">
-          <h1 className="title">들어 보세요</h1>
-          <p className="lead">{reviewMessage(review)}</p>
-          {warnings(review, pref.earphones).map((w) => (
-            <p key={w} className="pill pill-bad">
-              {w}
-            </p>
-          ))}
-          <div className="card review-card">
-            <button
-              className="play-btn"
-              onClick={() => {
-                if (revPlaying) {
-                  tRef.current?.pause();
-                  setRevPlaying(false);
-                } else void playReview(review.fin, nudge, review.sampleRate, review.raw.pass);
-              }}
-              aria-label={revPlaying ? '멈추기' : '다시 듣기'}
-            >
-              <Icon name={revPlaying ? 'pause' : 'play'} size={26} />
-            </button>
-            <TakeWave fin={review.fin} pass={review.raw.pass} nudge={nudge} getPosition={() => tRef.current?.position() ?? 0} playing={revPlaying} />
-          </div>
-          <div className="card sync-card">
-            <div className="sync-head">
-              <strong>목소리 타이밍</strong>
-              <output>{nudge === 0 ? '그대로' : nudge > 0 ? `${nudge}ms 늦게` : `${-nudge}ms 빠르게`}</output>
-            </div>
-            <div className="sync-row">
-              <button className="icon-btn" onClick={() => changeNudge(nudge - 10)} aria-label="10ms 빠르게">
-                <Icon name="minus" />
+              <button
+                className="btn btn-ghost"
+                onClick={() => {
+                  setPassIndex(0);
+                  setPhase('prep');
+                }}
+              >
+                다시 녹음하고 싶어요
               </button>
-              <input id="sync-nudge" type="range" min={-300} max={300} step={10} value={nudge} onChange={(e) => changeNudge(Number(e.target.value))} aria-label="목소리 타이밍" />
-              <button className="icon-btn" onClick={() => changeNudge(nudge + 10)} aria-label="10ms 늦게">
-                <Icon name="plus" />
-              </button>
-            </div>
-            <p className="hint">목소리가 반주보다 늦게 들리면 왼쪽(빠르게), 앞서 나가면 오른쪽(늦게)으로 옮겨요. 한 번 맞추면 다음 녹음부터 그대로 적용돼요.</p>
-            {review.choice.source !== 'measured' && pref.earphones && phase === 'review' && (
-              <button className="btn btn-secondary" onClick={() => setCalib({ open: true, state: 'idle' })}>
-                귀로 맞추기 어려우면 자동으로 재기
-              </button>
-            )}
-          </div>
-          <div className="bottom-bar two">
-            <button
-              className="btn btn-secondary btn-xl"
-              disabled={phase === 'saving'}
-              onClick={() => {
-                window.clearTimeout(nudgeTimer.current);
-                tRef.current?.stop();
-                setRevPlaying(false);
-                setPhase('ready');
-              }}
-            >
-              <Icon name="redo" />
-              다시 부르기
-            </button>
-            <button className="btn btn-primary btn-xl" onClick={save} disabled={phase === 'saving'}>
-              {phase === 'saving' ? '올리는 중…' : '이걸로 저장'}
-            </button>
-          </div>
-        </section>
-      )}
-
-      {phase === 'done' && (
-        <section className="stack done">
-          <p className="eyebrow-plain">{seatName(seat)} 파트</p>
-          <h1 className="title">다 불렀어요!</h1>
-          <p className="lead center">{room.blind && !room.revealed ? '모두 녹음을 마치면 한꺼번에 공개돼요.' : '방으로 돌아가면 지금까지 합쳐진 노래를 들을 수 있어요.'}</p>
-          <button className="btn btn-primary btn-xl" onClick={() => navigate(`/r/${code}`)}>
-            방으로 돌아가기
-          </button>
-          <button
-            className="btn btn-ghost"
-            onClick={() => {
-              setPassIndex(0);
-              setPhase('prep');
-            }}
-          >
-            다시 녹음하고 싶어요
-          </button>
-        </section>
+            </section>
+          )}
+        </>
       )}
 
       <Sheet open={calib.open} onClose={() => setCalib({ open: false, state: 'idle' })} title="싱크 미리 맞춰 두기">
@@ -646,9 +751,10 @@ export function Record({ code }: { code: string }) {
   );
 }
 
-function reviewMessage(r: Review): string {
+function reviewMessage(r: Review, yt: boolean): string {
   if (r.choice.source === 'measured') return '싱크는 자동으로 맞췄어요. 괜찮으면 저장하고, 어긋나면 아래 막대로 맞춰 주세요.';
   if (r.choice.source === 'remembered') return '지난번에 맞춘 싱크를 그대로 썼어요. 어긋나면 아래 막대로 맞춰 주세요.';
+  if (yt) return '영상과 목소리가 어긋나게 들리면 아래 막대로 맞춰 주세요. 유튜브 영상은 싱크를 자동으로 잴 수 없어서, 처음 한 번은 직접 맞춰야 해요.';
   return '반주와 목소리가 어긋나게 들리면 아래 막대로 맞춰 주세요.';
 }
 
@@ -656,6 +762,7 @@ function warnings(r: Review, earphones: boolean): string[] {
   const out: string[] = [];
   if (r.fin.stats.voiced < 0.4) out.push('목소리가 거의 안 들려요. 마이크가 막혀 있지 않은지 확인하고 다시 불러 보세요.');
   if (earphones && r.choice.leakDb !== undefined && r.choice.leakDb > -22) out.push('반주가 마이크에 꽤 크게 들어갔어요. 이어폰을 꼈는지 확인하거나 "이어폰 없이 하기"로 바꿔 주세요.');
+  if (r.shaky) out.push('부르는 동안 영상이 잠깐 멈칫했어요. 싱크가 어긋나게 들리면 다시 불러 주세요.');
   return out;
 }
 
@@ -709,6 +816,7 @@ function TakeWave({ fin, pass, nudge, getPosition, playing }: { fin: FinalTake &
 }
 
 // ───────── 노래방 무대 ─────────
+/** 무대의 내용물. 바깥 틀(main.stage)은 녹음 화면이 들고 있다 (유튜브 영상을 같은 자리에 두려고). */
 function Stage({
   room,
   roll,
@@ -716,7 +824,10 @@ function Stage({
   meterRef,
   passLabel,
   onCancel,
-  style,
+  onSinging,
+  ready,
+  tapHint,
+  video,
 }: {
   room: Room;
   roll: { pass: Pass; plan: PassPlan; tZero: number };
@@ -724,7 +835,12 @@ function Stage({
   meterRef: React.RefObject<HTMLDivElement>;
   passLabel: string;
   onCancel: () => void;
-  style: React.CSSProperties;
+  onSinging: (on: boolean) => void;
+  /** 반주가 실제로 돌기 시작했는지 (유튜브 영상은 시작까지 잠깐 걸린다) */
+  ready: boolean;
+  /** 브라우저가 막아서 영상을 직접 눌러 줘야 하는 상태 */
+  tapHint: boolean;
+  video: boolean;
 }) {
   const { plan, pass } = roll;
   const names = useMemo(() => seatNames(room), [room]);
@@ -737,6 +853,18 @@ function Stage({
   const headRef = useRef<HTMLDivElement>(null);
   const lastStart = useRef('');
   const span = plan.until - plan.from;
+  // 영상이 몇 초가 지나도 시작하지 않으면(보통 영상 앞 광고) 기다리면 된다고 알려 준다
+  const [slow, setSlow] = useState(false);
+  useEffect(() => {
+    if (ready) return setSlow(false);
+    const timer = window.setTimeout(() => setSlow(true), 4000);
+    return () => window.clearTimeout(timer);
+  }, [ready]);
+
+  useEffect(() => {
+    onSinging(singing);
+  }, [singing, onSinging]);
+  useEffect(() => () => onSinging(false), [onSinging]);
 
   useRaf(() => {
     const pos = getPosition();
@@ -744,7 +872,7 @@ function Stage({
     for (let i = 0; i < lines.length; i++) if (lines[i].t0 <= pos + 0.03) cur = i;
     if (cur !== idx) setIdx(cur);
     const line = cur >= 0 ? lines[cur] : null;
-    const inMine = pass.lines.some((l) => pos >= l.t0 - 0.05 && pos <= l.t1 + 0.1);
+    const inMine = ready && pass.lines.some((l) => pos >= l.t0 - 0.05 && pos <= l.t1 + 0.1);
     if (inMine !== singing) setSinging(inMine);
     if (fillRef.current && line) fillRef.current.style.setProperty('--p', `${Math.max(0, Math.min(1, (pos - line.t0) / Math.max(0.2, line.t1 - line.t0))) * 100}%`);
     if (headRef.current) headRef.current.style.left = `${Math.max(0, Math.min(1, (pos - plan.from) / span)) * 100}%`;
@@ -753,11 +881,11 @@ function Stage({
     const lead = next ? next.t0 - pos : 0;
     const prevMine = next ? [...pass.lines].reverse().find((l) => l.t1 <= next.t0) : undefined;
     const fresh = next && (!prevMine || next.t0 - prevMine.t1 > 1.6);
-    const c = fresh && lead <= 3.05 ? Math.ceil(lead) : 0;
+    const c = ready && fresh && lead <= 3.05 ? Math.ceil(lead) : 0;
     if (c !== count) setCount(c);
     // 내 줄이 시작하는 순간 진동
     const started = pass.lines.find((l) => pos >= l.t0 && pos < l.t0 + 0.12);
-    if (started && lastStart.current !== started.id) {
+    if (ready && started && lastStart.current !== started.id) {
       lastStart.current = started.id;
       if (navigator.vibrate) navigator.vibrate(35);
     }
@@ -773,7 +901,7 @@ function Stage({
   const slots = [nowIdx - 1, nowIdx, nowIdx + 1, nowIdx + 2];
 
   return (
-    <main className={`stage${singing ? ' is-singing' : ''}`} style={style}>
+    <>
       <header className="stage-top">
         <button className="icon-btn" onClick={onCancel} aria-label="녹음 그만하기">
           <Icon name="close" />
@@ -788,7 +916,18 @@ function Stage({
       </header>
 
       <div className="stage-status" aria-live="polite">
-        {singing ? (
+        {!ready ? (
+          tapHint ? (
+            <span className="waiting stage-prep">영상이 멈춰 있으면 ▶ 를 눌러 주세요. 광고가 나오는 중이면 끝날 때까지 기다려요.</span>
+          ) : (
+            <span className="waiting stage-prep is-col">
+              <span className="stage-prep-row">
+                <span className="spinner" /> 영상을 준비하는 중…
+              </span>
+              {slow && <small>광고가 나오면 끝난 뒤에 시작해요.</small>}
+            </span>
+          )
+        ) : singing ? (
           <span className="on-air">
             <span className="rec-dot" /> 지금 불러요
           </span>
@@ -825,9 +964,9 @@ function Stage({
           <div ref={meterRef} />
         </div>
         <p>
-          <span className="rec-dot" /> 녹음 중이에요. 끝까지 가면 자동으로 멈춰요.
+          <span className="rec-dot" /> 녹음 중이에요. 끝까지 가면 자동으로 멈춰요.{video ? ' 영상은 누르지 말아 주세요.' : ''}
         </p>
       </footer>
-    </main>
+    </>
   );
 }
