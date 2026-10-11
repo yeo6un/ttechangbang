@@ -29,7 +29,7 @@ function adapterFor(d1) {
 }
 
 function apiEnv(env) {
-  return { DB: adapterFor(env.DB), AI: env.AI, AI_ASR_MODEL: env.AI_ASR_MODEL, AI_TEXT_MODEL: env.AI_TEXT_MODEL };
+  return { DB: adapterFor(env.DB), AI: env.AI, AI_ASR_MODEL: env.AI_ASR_MODEL, AI_TEXT_MODEL: env.AI_TEXT_MODEL, YOUTUBE_API_KEY: env.YOUTUBE_API_KEY };
 }
 
 export default {

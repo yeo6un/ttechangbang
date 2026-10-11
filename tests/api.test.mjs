@@ -19,7 +19,7 @@ const base = EXTERNAL || `http://127.0.0.1:${PORT}`;
 const server = EXTERNAL
   ? null
   : spawn(process.execPath, [path.join(root, 'server/node-server.mjs')], {
-      env: { ...process.env, PORT: String(PORT), DATA_DIR: dataDir },
+      env: { ...process.env, PORT: String(PORT), DATA_DIR: dataDir, MOCK_FIND: '1' },
       stdio: ['ignore', 'pipe', 'inherit'],
     });
 if (server) {
@@ -243,6 +243,111 @@ try {
     assert.equal((await call('GET', '/api/nothing')).status, 404);
     assert.equal((await call('POST', `/api/rooms/${code}/me`, { member: { id: a.id, key: 'ff'.repeat(24) }, body: { seat: 0 } })).status, 401);
   });
+
+  // ───────── 유튜브 영상을 반주로 쓰는 방 ─────────
+  await step('유튜브 반주 방: 노래 파일 없이 열리고, 한 곡 전체 길이까지 된다', async () => {
+    const bad = await call('POST', '/api/rooms', { body: { title: 'x', hostName: 'h', song: { dur: 200, yt: { id: 'nope' } } } });
+    assert.equal(bad.status, 400);
+    assert.equal(bad.data.error.code, 'bad_video');
+    // 파일 방은 여전히 125초까지만
+    assert.equal((await call('POST', '/api/rooms', { body: { title: 'x', hostName: 'h', song: { dur: 200 } } })).data.room.song.dur, 125);
+    const r = await call('POST', '/api/rooms', {
+      body: { title: '연습용 노래', hostName: '방장', seatCount: 2, song: { dur: 200, name: '연습용 노래', artist: '떼창방 밴드', art: 'https://evil.example/x.jpg', yt: { id: 'https://youtu.be/ttbDEMO0001?t=3', start: 12.3456, len: 215, title: '영상 제목', author: '채널' } } },
+    });
+    assert.equal(r.status, 201);
+    const y = r.data;
+    assert.deepEqual(y.room.song.yt, { id: 'ttbDEMO0001', start: 12.346, len: 215, title: '영상 제목', author: '채널' });
+    assert.equal(y.room.song.dur, 200);
+    assert.equal(y.room.song.art, ''); // 허용한 그림 주소가 아니면 버린다
+    assert.equal(y.room.song.blob, null);
+    const lines = [{ id: 'a', t0: 150, t1: 160, text: '뒤쪽 줄', seats: [0] }, { id: 'b', t0: 3, t1: 8, text: '앞쪽 줄', seats: [1] }];
+    assert.equal((await call('PUT', `/api/rooms/${y.code}/parts`, { member: y.member, body: { lines, seatCount: 2 } })).data.lines[1].t0, 150);
+    const open = await call('PUT', `/api/rooms/${y.code}/settings`, { member: y.member, body: { draft: false } });
+    assert.equal(open.status, 200);
+    assert.equal(open.data.draft, false);
+    await call('POST', `/api/rooms/${y.code}/me`, { member: y.member, body: { seat: 0 } });
+    const take = await call('POST', `/api/rooms/${y.code}/takes`, { member: y.member, bin: fakeAudio(9000), headers: takeMeta({ seat: 0, start: 149.7, dur: 10.8 }) });
+    assert.equal(take.status, 201);
+    assert.equal(take.data.room.takes[0].start, 149.7);
+    // 받아쓰기 AI 는 저장된 음원이 있어야 해서 이 방에서는 쓸 수 없다
+    assert.ok([409, 501].includes((await call('POST', `/api/rooms/${y.code}/ai/align`, { member: y.member, body: {} })).status));
+    await call('DELETE', `/api/rooms/${y.code}`, { member: y.member });
+  });
+
+  if (!EXTERNAL) {
+    await step('곡 찾기: 가수·곡 이름으로 목록이 나온다', async () => {
+      assert.equal((await call('GET', '/api/find/songs?q=a')).status, 400);
+      const r = await call('GET', `/api/find/songs?q=${encodeURIComponent('떼창방 밴드 연습용 노래')}`);
+      assert.equal(r.status, 200);
+      assert.equal(r.data.via, 'itunes');
+      const s = r.data.songs[0];
+      assert.equal(s.title, '연습용 노래');
+      assert.equal(s.artist, '떼창방 밴드');
+      assert.equal(s.itunesId, 1001);
+      assert.equal(s.dur, 24);
+      assert.match(s.art, /200x200bb/);
+      assert.equal((await call('GET', `/api/find/songs?q=${encodeURIComponent('세상에없는노래zzz')}`)).data.songs.length, 0);
+    });
+
+    await step('곡 찾기: 곡 검색 서버가 죽어도 가사 서버 목록으로 대신한다', async () => {
+      const r = await call('GET', '/api/find/songs?q=itunesdown%20practice');
+      assert.equal(r.data.via, 'lrclib');
+      const s = r.data.songs.find((x) => x.artist === 'Ttechang Band' && x.title === 'Practice Song');
+      assert.equal(s.lyrics, 'synced');
+      assert.equal(s.lrclibId, 501);
+      const l = await call('GET', `/api/find/lyrics?lrclib=${s.lrclibId}`);
+      assert.equal(l.data.found, true);
+      assert.match(l.data.synced, /^\[00:02\.61\]/);
+    });
+
+    await step('가사 찾기: 한글 이름으로 없으면 영어 표기로 다시 찾고, 제목만 같은 남의 곡은 고르지 않는다', async () => {
+      const q = `title=${encodeURIComponent('연습용 노래')}&artist=${encodeURIComponent('떼창방 밴드')}&dur=24&itunes=1001`;
+      const r = await call('GET', `/api/find/lyrics?${q}`);
+      assert.equal(r.status, 200);
+      assert.equal(r.data.found, true);
+      assert.equal(r.data.id, 501);
+      assert.equal(r.data.source, 'LRCLIB');
+      assert.equal(r.data.synced.split('\n').length, 8);
+      // 시간표 없는 가사만 있는 곡
+      const u = await call('GET', `/api/find/lyrics?title=${encodeURIComponent('타이밍 없는 노래')}&artist=${encodeURIComponent('떼창방 밴드')}&dur=24&itunes=1003`);
+      assert.equal(u.data.found, true);
+      assert.equal(u.data.synced, '');
+      assert.equal(u.data.plain.split('\n').length, 8);
+      // 가사가 없는 곡
+      const none = await call('GET', `/api/find/lyrics?title=${encodeURIComponent('가사 없는 노래')}&artist=${encodeURIComponent('떼창방 밴드')}&dur=200&itunes=1002`);
+      assert.equal(none.data.found, false);
+    });
+
+    await step('영상 찾기와 링크 확인', async () => {
+      const v = await call('GET', `/api/find/video?title=${encodeURIComponent('연습용 노래')}&artist=${encodeURIComponent('떼창방 밴드')}&itunes=1001&dur=24`);
+      assert.equal(v.data.found, true);
+      assert.equal(v.data.id, 'ttbDEMO0001');
+      assert.equal(v.data.via, 'odesli');
+      assert.match(v.data.title, /연습용 노래/);
+      assert.equal((await call('GET', `/api/find/video?title=${encodeURIComponent('가사 없는 노래')}&itunes=1002`)).data.found, false);
+      const ok = await call('GET', `/api/find/yt?url=${encodeURIComponent('https://m.youtube.com/watch?v=ttbMV000001&feature=share')}`);
+      assert.equal(ok.data.ok, true);
+      assert.equal(ok.data.id, 'ttbMV000001');
+      assert.match(ok.data.title, /M\/V/);
+      const blocked = await call('GET', '/api/find/yt?url=https://youtu.be/blockedAAAA');
+      assert.equal(blocked.data.ok, false);
+      assert.equal(blocked.data.reason, 'blocked');
+      assert.equal((await call('GET', '/api/find/yt?url=https://youtu.be/missingAAAA')).data.reason, 'missing');
+      const bad = await call('GET', `/api/find/yt?url=${encodeURIComponent('https://example.com/watch?v=ttbDEMO0001')}`);
+      assert.equal(bad.status, 400);
+    });
+
+    await step('찾은 결과는 저장해 두고 다시 묻지 않는다', async () => {
+      const db = new DatabaseSync(path.join(dataDir, 'ttechang.db'));
+      const keys = db.prepare('SELECT key FROM cache').all().map((r) => r.key);
+      db.close();
+      assert.ok(keys.some((k) => k.startsWith('songs:')));
+      assert.ok(keys.some((k) => k.startsWith('lyrics:')));
+      assert.ok(keys.some((k) => k.startsWith('video:')));
+      assert.ok(keys.includes('yt:ttbMV000001'));
+      assert.ok(!keys.includes('yt:blockedAAAA')); // 실패한 결과는 저장하지 않는다
+    });
+  }
 
   if (!EXTERNAL) await step('기간이 끝난 방은 410 을 주고 통째로 지워진다', async () => {
     const r = await call('POST', '/api/rooms', { body: { title: '곧 사라질 방', hostName: 'h', song: { dur: 10 } } });

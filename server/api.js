@@ -3,6 +3,7 @@
 // env.DB 는 { run, all, get, batch } 를 가진 얇은 어댑터다 (db-d1.js / node-server.mjs 참고).
 
 import { aiAlign, aiSplit } from './ai.js';
+import { findLyrics, findSongs, findVideo, parseYtId, ytInfo } from './find.js';
 
 const DAY = 86_400_000;
 const HOUR = 3_600_000;
@@ -11,11 +12,13 @@ export const LIMITS = {
   songBytes: 6 * 1024 * 1024,
   takeBytes: 3 * 1024 * 1024,
   songSeconds: 125,
+  /** 유튜브 영상을 반주로 쓰는 방은 음원을 저장하지 않으므로 한 곡 전체까지 허용한다 */
+  ytSeconds: 330,
   seats: 8,
   lines: 200,
   lineText: 140,
   members: 40,
-  takesPerRoom: 120,
+  takesPerRoom: 200,
   title: 60,
   name: 16,
   draftTtl: DAY,
@@ -67,6 +70,11 @@ export const SCHEMA = [
     room TEXT NOT NULL,
     data TEXT NOT NULL,
     PRIMARY KEY (id, seq)
+  )`,
+  `CREATE TABLE IF NOT EXISTS cache (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    expires_at INTEGER NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS idx_members_room ON members (room)`,
   `CREATE INDEX IF NOT EXISTS idx_takes_room ON takes (room)`,
@@ -223,9 +231,31 @@ async function deleteRoom(db, code) {
   ]);
 }
 
+/** 바깥 서비스에 물어본 결과를 잠깐 저장해 둔다 (같은 곡을 여러 번 묻지 않게) */
+async function cached(db, key, ttlMs, fn, keep = () => true) {
+  const k = key.slice(0, 300);
+  const now = Date.now();
+  try {
+    const row = await db.get('SELECT value FROM cache WHERE key = ? AND expires_at > ?', k, now);
+    if (row) return JSON.parse(row.value);
+  } catch {
+    /* 저장해 둔 값이 깨졌으면 새로 묻는다 */
+  }
+  const value = await fn();
+  if (keep(value)) {
+    try {
+      await db.run('INSERT INTO cache (key, value, expires_at) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, expires_at = excluded.expires_at', k, JSON.stringify(value), now + ttlMs);
+    } catch {
+      /* 저장에 실패해도 결과는 돌려준다 */
+    }
+  }
+  return value;
+}
+
 export async function purgeExpired(env) {
   const db = env.DB;
   await ensureSchema(db);
+  await db.run('DELETE FROM cache WHERE expires_at < ?', Date.now());
   const rows = await db.all('SELECT code FROM rooms WHERE expires_at < ? LIMIT 50', Date.now());
   for (const r of rows) await deleteRoom(db, r.code);
   return rows.length;
@@ -331,8 +361,25 @@ function sanitizeLines(input, seatCount, songDur) {
   return out;
 }
 
+/** 유튜브 영상을 반주로 쓰는 방: 영상 번호와, 영상 안에서 구간이 시작하는 위치만 저장한다 */
+function sanitizeYt(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const id = parseYtId(raw.id);
+  if (!id) fail(400, 'bad_video', '유튜브 영상 주소가 올바르지 않아요.');
+  return {
+    id,
+    start: Math.round(num(raw.start, 0, 43200, 0) * 1000) / 1000,
+    len: Math.round(num(raw.len, 0, 43200, 0)),
+    title: cleanText(raw.title, 120),
+    author: cleanText(raw.author, 80),
+  };
+}
+
+const safeArt = (v) => (typeof v === 'string' && v.length <= 300 && /^https:\/\/([a-z0-9-]+\.)*(mzstatic\.com|ytimg\.com)\//.test(v) ? v : '');
+
 function sanitizeSongMeta(raw) {
-  const dur = num(raw?.dur, 1, LIMITS.songSeconds, NaN);
+  const yt = sanitizeYt(raw?.yt);
+  const dur = num(raw?.dur, 1, yt ? LIMITS.ytSeconds : LIMITS.songSeconds, NaN);
   if (!Number.isFinite(dur)) fail(400, 'bad_song', '곡 길이 정보가 올바르지 않아요.');
   const peaks = typeof raw.peaks === 'string' && raw.peaks.length <= 4000 && /^[A-Za-z0-9+/=]*$/.test(raw.peaks) ? raw.peaks : '';
   return {
@@ -340,9 +387,12 @@ function sanitizeSongMeta(raw) {
     lead: num(raw.lead, 0, 1, 0),
     peaks,
     name: cleanText(raw.name, 80),
+    artist: cleanText(raw.artist, 80),
+    art: safeArt(raw.art),
     bpm: num(raw.bpm, 0, 300, 0),
     beat0: num(raw.beat0, 0, 10, 0),
     demo: !!raw.demo,
+    ...(yt ? { yt } : {}),
   };
 }
 
@@ -367,7 +417,43 @@ async function route(request, env, ctx) {
   const ip = clientIp(request);
 
   if (seg[0] === 'config' && method === 'GET') {
-    return json({ ai: !!env.AI, limits: { songSeconds: LIMITS.songSeconds, seats: LIMITS.seats, roomDays: LIMITS.roomTtl / DAY }, now: Date.now() });
+    return json({ ai: !!env.AI, find: true, limits: { songSeconds: LIMITS.songSeconds, ytSeconds: LIMITS.ytSeconds, seats: LIMITS.seats, roomDays: LIMITS.roomTtl / DAY }, now: Date.now() });
+  }
+
+  // 곡·가사·유튜브 영상 찾기 (방과 상관없이 쓸 수 있다)
+  if (seg[0] === 'find' && method === 'GET') {
+    if (!rateLimit('find:' + ip, 90, 10 * 60_000)) fail(429, 'slow_down', '너무 자주 찾고 있어요. 잠시 뒤에 다시 해 주세요.');
+    const p = url.searchParams;
+    const text = (k, max) => cleanText(p.get(k), max);
+    const intOf = (k) => {
+      const n = Number(p.get(k));
+      return Number.isInteger(n) && n > 0 ? n : 0;
+    };
+    if (seg[1] === 'songs') {
+      const q = text('q', 80);
+      if (q.length < 2) fail(400, 'short_query', '가수나 곡 이름을 두 글자 이상 넣어 주세요.');
+      return json(await cached(db, 'songs:' + q.toLowerCase(), DAY, () => findSongs(env, q), (v) => v.songs.length > 0));
+    }
+    if (seg[1] === 'lyrics') {
+      const want = { title: text('title', 120), artist: text('artist', 80), dur: num(p.get('dur'), 0, 3600, 0), lrclibId: intOf('lrclib'), itunesId: intOf('itunes') };
+      if (!want.title && !want.lrclibId) fail(400, 'no_title', '곡 이름이 필요해요.');
+      const key = `lyrics:${want.lrclibId}:${want.itunesId}:${want.title.toLowerCase()}|${want.artist.toLowerCase()}|${Math.round(want.dur)}`;
+      // 못 찾은 결과는 잠깐만 기억한다 (가사가 나중에 올라올 수 있다)
+      const hit = await cached(db, key, 7 * DAY, () => findLyrics(env, want), (v) => v.found);
+      return json(hit);
+    }
+    if (seg[1] === 'video') {
+      const want = { title: text('title', 120), artist: text('artist', 80), dur: num(p.get('dur'), 0, 3600, 0), itunesId: intOf('itunes') };
+      if (!want.title && !want.itunesId) fail(400, 'no_title', '곡 이름이 필요해요.');
+      const key = `video:${env.YOUTUBE_API_KEY ? 'k' : 'o'}:${want.itunesId}:${want.title.toLowerCase()}|${want.artist.toLowerCase()}`;
+      return json(await cached(db, key, 7 * DAY, () => findVideo(env, want), (v) => v.found));
+    }
+    if (seg[1] === 'yt') {
+      const id = parseYtId(p.get('url') || '');
+      if (!id) fail(400, 'bad_video', '유튜브 영상 주소가 아니에요. 영상의 "공유 → 링크 복사"로 받은 주소를 붙여 넣어 주세요.');
+      return json(await cached(db, 'yt:' + id, DAY, () => ytInfo(env, id), (v) => v.ok && !v.unverified));
+    }
+    fail(404, 'no_route', '없는 주소예요.');
   }
 
   if (seg[0] !== 'rooms') fail(404, 'no_route', '없는 주소예요.');
@@ -525,7 +611,7 @@ async function route(request, env, ctx) {
     }
     if (body.revealed !== undefined) s.revealed = !!body.revealed;
     if (body.draft === false && s.draft) {
-      if (!room.song_blob) fail(409, 'no_song', '노래가 아직 올라가지 않았어요. 잠시 뒤 다시 눌러 주세요.');
+      if (!room.song_blob && !JSON.parse(room.song_meta).yt) fail(409, 'no_song', '노래가 아직 올라가지 않았어요. 잠시 뒤 다시 눌러 주세요.');
       s.draft = false;
       expires = Date.now() + LIMITS.roomTtl;
     }
@@ -559,7 +645,7 @@ async function route(request, env, ctx) {
       if (me.seat !== seat) fail(403, 'not_your_seat', '내 파트가 아니에요. 방에서 파트를 먼저 골라 주세요.');
       const songDur = JSON.parse(room.song_meta).dur;
       const start = num(meta.start, -2, songDur, NaN);
-      const dur = num(meta.dur, 0.2, LIMITS.songSeconds + 5, NaN);
+      const dur = num(meta.dur, 0.2, songDur + 5, NaN);
       if (!Number.isFinite(start) || !Number.isFinite(dur)) fail(400, 'bad_meta', '녹음 정보가 올바르지 않아요.');
       const count = await db.get('SELECT COUNT(*) AS n FROM takes WHERE room = ?', code);
       if (count.n >= LIMITS.takesPerRoom) fail(409, 'too_many', '이 방에 녹음이 너무 많아요. 안 쓰는 녹음을 지워 주세요.');

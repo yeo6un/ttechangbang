@@ -39,9 +39,11 @@ const DB = {
     }
   },
 };
-const env = { DB };
+const env = { DB, YOUTUBE_API_KEY: process.env.YOUTUBE_API_KEY || undefined };
 // 테스트용 가짜 AI (Cloudflare 없이 AI 화면 흐름을 확인할 때만): MOCK_AI=1 npm start
 if (process.env.MOCK_AI) env.AI = (await import('../tests/mock-ai.mjs')).default;
+// 테스트용 가짜 검색 서버 (바깥 서비스 대신 정해 둔 응답을 돌려준다): MOCK_FIND=1 npm start
+if (process.env.MOCK_FIND) env.fetch = (await import('../tests/mock-find.mjs')).default;
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
